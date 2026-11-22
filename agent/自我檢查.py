@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-"""AI File 自我檢查 v1.2
-檢查設定檔、路徑守門、雜湊驗證、停止旗標、manifest 解析、版本比對與連線。
+"""AI File 自我檢查 v1.3
+檢查設定檔、路徑守門、雜湊驗證、停止旗標、manifest 解析、版本比對、連線、
+備份與返回。
 用法：python 自我檢查.py
 全部 [OK] 才算通過。第 10 步連線是正式檢查：失敗會印完整錯誤＋原因對照，
 沒有 PAT 也會明確講要先完成設定精靈，不是一句警告就帶過。
@@ -35,9 +36,25 @@ def warn(name, note=""):
     print("[警告] %s %s" % (name, ("（" + note + "）") if note else ""))
 
 
+def _reset_check(relay, code):
+    """啟動重設：session 是 approved 時，啟動後要變回 waiting。"""
+    relay.put_json("session.json", {
+        "status": "approved", "ai_name": "Muse",
+        "code_hash": A.code_hash(code)}, "test")
+    A.reset_approved_session_on_start(relay)
+    session, _ = relay.get_json("session.json")
+    return isinstance(session, dict) and session.get("status") == "waiting"
+
+
 def main():
     print("AI File 自我檢查 v%s" % A.VERSION)
     print("=" * 40)
+
+    # 同步紀錄與備份改寫到暫存目錄，自我檢查不污染程式資料夾的真實紀錄
+    _hist_tmp = tempfile.mkdtemp(prefix="aifile_check_hist_")
+    _bak_tmp = tempfile.mkdtemp(prefix="aifile_check_bak_")
+    A.HISTORY_FILE = os.path.join(_hist_tmp, "ai-file-history.json")
+    A.BACKUP_DIR = os.path.join(_bak_tmp, "ai-file-backup")
 
     # 1. Python 與 tkinter
     check("Python 3.8 以上", sys.version_info >= (3, 8),
@@ -185,13 +202,76 @@ def main():
               "（需要先去 GitHub 產生細粒度 Token）")
 
     # 11. 版本比對
-    check("版本比對：1.2 > 1.1",
-          A.parse_version("1.2") > A.parse_version("1.1"))
+    check("版本比對：1.3 > 1.2",
+          A.parse_version("1.3") > A.parse_version("1.2"))
     check("版本比對：1.10 > 1.2",
           A.parse_version("1.10") > A.parse_version("1.2"))
-    check("版本比對：1.2 == 1.2",
-          A.parse_version("1.2") == A.parse_version("1.2"))
-    check("VERSION 是 1.2", A.VERSION == "1.2")
+    check("版本比對：1.3 == 1.3",
+          A.parse_version("1.3") == A.parse_version("1.3"))
+    check("VERSION 是 1.3", A.VERSION == "1.3")
+
+    # 12. 備份與返回（本機假中繼＋自動同意的假 UI）
+    btmp = tempfile.mkdtemp(prefix="aifile_check_undo_")
+    brelay = A.LocalRelay(btmp)
+    ballowed = os.path.join(btmp, "allowed")
+    os.makedirs(ballowed, exist_ok=True)
+    bcode = A.new_session_code()
+    bagent = A.Agent({"pat": "fake", "allowed_folder": ballowed,
+                      "session_code": bcode},
+                     brelay, A.HeadlessUI(approve=True))
+    # 改一支舊檔、刪一支舊檔、新增一支檔案，再全部返回
+    with open(os.path.join(ballowed, "old.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("原本的內容")
+    with open(os.path.join(ballowed, "todel.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("等一下會被刪掉")
+    brelay.put_json("stop.json", {"stopped": False}, "test")
+    brelay.put_json("session.json", {
+        "status": "approved", "ai_name": "Muse",
+        "code_hash": A.code_hash(bcode)}, "test")
+    new_payload = "新的內容".encode("utf-8")
+    del_payload = b""
+    brelay.put_bytes("pending/001_aaa_old.txt", new_payload, "test")
+    bmanifest = {"files": [
+        {"rel_path": "old.txt", "file": "001_aaa_old.txt",
+         "action": "add", "sha256": A.sha256_bytes(new_payload),
+         "ai_name": "Muse", "time": "2026-11-22T00:00:00Z",
+         "session_code": bcode},
+        {"rel_path": "todel.txt", "action": "delete",
+         "ai_name": "Muse", "time": "2026-11-22T00:00:00Z",
+         "session_code": bcode},
+        {"rel_path": "brandnew.txt", "file": "002_bbb_new.txt",
+         "action": "add", "sha256": A.sha256_bytes(del_payload),
+         "ai_name": "Muse", "time": "2026-11-22T00:00:00Z",
+         "session_code": bcode},
+    ]}
+    brelay.put_bytes("pending/002_bbb_new.txt", del_payload, "test")
+    brelay.put_json("pending/manifest.json", bmanifest, "test")
+    bagent.poll_once()
+    check("備份與返回：修改有寫入",
+          open(os.path.join(ballowed, "old.txt"),
+               encoding="utf-8").read() == "新的內容")
+    check("備份與返回：刪除有執行",
+          not os.path.exists(os.path.join(ballowed, "todel.txt")))
+    check("備份與返回：新增有寫入",
+          os.path.exists(os.path.join(ballowed, "brandnew.txt")))
+    hist = A.load_history()
+    check("備份與返回：同步紀錄有寫入",
+          len(hist) >= 1 and len(hist[0]["items"]) == 3
+          and hist[0]["items"][0]["rel_path"] == "old.txt")
+    bid = hist[0]["id"]
+    undone = bagent.undo_batch(bid)
+    check("備份與返回：返回成功",
+          undone
+          and open(os.path.join(ballowed, "old.txt"),
+                   encoding="utf-8").read() == "原本的內容"
+          and os.path.exists(os.path.join(ballowed, "todel.txt"))
+          and not os.path.exists(os.path.join(ballowed, "brandnew.txt")))
+    check("備份與返回：一批只能返回一次",
+          not bagent.undo_batch(bid))
+    check("備份與返回：啟動重設已允許的工作階段",
+          _reset_check(brelay, bcode))
 
     print("=" * 40)
     print("結果：%d 通過，%d 失敗" % (PASS, FAIL))

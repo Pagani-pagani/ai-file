@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI File 本地端程式 v1.2
+AI File 本地端程式 v1.3
 ===================
 讓 Muse 把檔案直接送到你的 Windows 電腦。
 架構：網頁版只能把檔案暫存到私人中繼 repo（ai-file-relay），
@@ -33,7 +33,7 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 
-VERSION_DEFAULT = "1.2"
+VERSION_DEFAULT = "1.3"
 RELAY_OWNER = "Pagani-pagani"
 RELAY_REPO = "ai-file-relay"
 GITHUB_API = "https://api.github.com"
@@ -45,6 +45,9 @@ PUBLIC_ZIP_URL = (
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "ai-file-config.json")
 LOG_FILE = os.path.join(BASE_DIR, "ai-file-log.txt")
+HISTORY_FILE = os.path.join(BASE_DIR, "ai-file-history.json")
+BACKUP_DIR = os.path.join(BASE_DIR, "ai-file-backup")
+HISTORY_KEEP = 20  # 備份紀錄只留最近幾批
 UPDATE_BAT = os.path.join(BASE_DIR, "更新 AI File.bat")
 
 # 連線失敗的原因對照表（自我檢查、設定精靈、浮動視窗共用）
@@ -386,6 +389,41 @@ def save_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
+# ---------------------------------------------------------------- 備份與返回（同步紀錄）
+def new_batch_id():
+    """同步批次 id：時間＋短亂數，例如 20261122-190000-a1b2。"""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return "%s-%s" % (stamp, secrets.token_hex(2))
+
+
+def load_history():
+    """讀本機同步紀錄（新到舊）。檔案壞掉或不存在回傳空清單。"""
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_history(history):
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def prune_history(history):
+    """只留最近 HISTORY_KEEP 批，舊的備份資料夾一起清掉。"""
+    removed = history[HISTORY_KEEP:]
+    del history[HISTORY_KEEP:]
+    for batch in removed:
+        try:
+            shutil.rmtree(os.path.join(BACKUP_DIR, batch.get("id", "")),
+                          ignore_errors=True)
+        except OSError:
+            pass
+    return history
+
+
 def append_activity(relay, entry):
     """把一筆紀錄 append 到中繼的 activity.json。"""
     try:
@@ -680,12 +718,102 @@ class TkUI:
         ttk.Button(btns, text="重設資料",
                    command=self.agent.reset_data
                    ).pack(side="left")
+        btns2 = ttk.Frame(win)
+        btns2.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Button(btns2, text="紀錄",
+                   command=self.agent.open_history
+                   ).pack(side="left", padx=(0, 4))
+        ttk.Button(btns2, text="結束程式",
+                   command=self.agent.quit_program
+                   ).pack(side="left")
+        ttk.Label(win, text="關掉視窗只會隱藏，程式還在跑；"
+                  "要真正結束請按「結束程式」。",
+                  font=("Microsoft JhengHei", 9)).pack(
+                      anchor="w", padx=12, pady=(0, 4))
         stop_btn = tk.Button(
             win, text="■ 停止", font=("Microsoft JhengHei", 14, "bold"),
             bg="#c0392b", fg="white", height=2,
             command=self.agent.stop_from_local)
         stop_btn.pack(fill="x", padx=12, pady=(0, 12))
         self.float_win = win
+
+    def open_history(self, agent):
+        """同步紀錄視窗：由新到舊列出每一批，每批有「返回」按鈕。"""
+        import tkinter as tk
+        from tkinter import ttk
+        history = load_history()
+        win = tk.Toplevel(self.root)
+        win.title("AI File：同步紀錄")
+        win.attributes("-topmost", True)
+        win.geometry("640x480")
+        ttk.Label(win, text="同步紀錄（只留最近 20 批，舊的自動清掉）",
+                  font=("Microsoft JhengHei", 12, "bold")).pack(
+                      anchor="w", padx=16, pady=(12, 4))
+        ttk.Label(win, text="按「返回」可以回到該批同步前的狀態："
+                  "被改過／刪掉的檔案從備份還原，被新增的檔案刪掉。",
+                  font=("Microsoft JhengHei", 10)).pack(
+                      anchor="w", padx=16, pady=(0, 8))
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        if not history:
+            ttk.Label(frame, text="還沒有同步紀錄。").pack(anchor="w")
+            return
+        canvas = tk.Canvas(frame)
+        scroll = ttk.Scrollbar(frame, orient="vertical",
+                               command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        for batch in history:
+            row = ttk.Frame(inner, relief="solid", borderwidth=1)
+            row.pack(fill="x", pady=4)
+            head = "%s · %s · %d 個變更" % (
+                batch.get("at", "")[:19].replace("T", " "),
+                batch.get("ai_name", ""), len(batch.get("items", [])))
+            ttk.Label(row, text=head,
+                      font=("Microsoft JhengHei", 11, "bold")).pack(
+                          anchor="w", padx=10, pady=(6, 2))
+            for item in batch.get("items", []):
+                verb = {"add": "新增", "modify": "修改",
+                        "delete": "刪除"}.get(
+                            item.get("action", "add"), "新增")
+                ttk.Label(row, text="  [%s] %s" % (
+                    verb, item.get("rel_path", "")),
+                    font=("Microsoft JhengHei", 10)).pack(
+                        anchor="w", padx=10)
+            if batch.get("undone"):
+                ttk.Label(row, text="已返回（%s）" % batch.get(
+                    "undone_at", "")[:19],
+                    font=("Microsoft JhengHei", 10)).pack(
+                        anchor="w", padx=10, pady=(2, 6))
+            else:
+                ttk.Button(row, text="返回",
+                           command=lambda bid=batch["id"], w=win: (
+                               self._do_undo(agent, bid, w))
+                           ).pack(anchor="w", padx=10, pady=(2, 6))
+
+    def _do_undo(self, agent, batch_id, win):
+        import tkinter.messagebox as mb
+        if not mb.askyesno(
+                "AI File：返回",
+                "確定要把這批同步返回到同步前的狀態嗎？\n"
+                "被改過／刪掉的檔案會從備份還原，被新增的檔案會刪掉。",
+                parent=win):
+            return
+        agent.undo_batch(batch_id)
+        win.destroy()
+        self.open_history(agent)
+
+    def quit_program(self):
+        """真的結束整個程式（關掉浮動視窗只會隱藏，程式還在跑）。"""
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def add_activity(self, entry):
         if self.float_list is None:
@@ -696,6 +824,9 @@ class TkUI:
                       "session-rejected": "已拒絕連線",
                       "rejected-path": "已拒絕越界",
                       "stopped": "已停止",
+                      "undone": "已返回",
+                      "undo-requested": "要求返回",
+                      "undo-declined": "已拒絕返回",
                       "synced": "已同步"}.get(entry.get("action", ""),
                                                 entry.get("action", ""))
             text = "%s [%s] %s %s" % (
@@ -742,6 +873,12 @@ class HeadlessUI:
     def quit_app(self):
         self.quit_requested = True
 
+    def quit_program(self):
+        self.quit_requested = True
+
+    def open_history(self, agent):
+        pass
+
     def notify(self, title, message):
         self.notices.append((title, message))
         print("[通知] %s：%s" % (title, message))
@@ -782,6 +919,7 @@ class Agent:
         self._resetting = False
         self._last_manifest_sig = None
         self._seen_waiting = set()
+        self._seen_undo = set()
         self._last_heartbeat = 0
         self._pending_notice_sig = None
         self._last_poll_ok_at = 0
@@ -859,6 +997,118 @@ class Agent:
             self.ui.call_on_main(done)
         threading.Thread(target=work, daemon=True).start()
 
+    def open_history(self):
+        """打開同步紀錄視窗。"""
+        self.ui.open_history(self)
+
+    def quit_program(self):
+        """真的結束整個程式（關掉浮動視窗只會隱藏，程式還在跑）。"""
+        try:
+            self.ui.quit_program()
+        except Exception:
+            pass
+
+    # -- 備份與返回 ------------------------------------------------
+    def undo_batch(self, batch_id):
+        """把一批同步返回到同步前的狀態：被改過／刪掉的檔案從備份還原，
+        被新增的檔案刪掉。一批只能返回一次。"""
+        history = load_history()
+        batch = next((b for b in history if b.get("id") == batch_id), None)
+        if batch is None:
+            append_activity(self.relay, {
+                "action": "undo-failed", "ai_name": "",
+                "batch_id": batch_id,
+                "detail": "找不到這批同步的備份（可能已超過 20 批被清掉）"})
+            self.ui.notify("AI File：找不到備份",
+                           "找不到這批同步的備份（可能已經超過 20 批被清掉）。")
+            log_local("返回失敗：找不到批次 %s" % batch_id)
+            return False
+        if batch.get("undone"):
+            self.ui.notify("AI File", "這批已經返回過了。")
+            return False
+        ok_count = 0
+        fail_count = 0
+        batch_dir = os.path.join(BACKUP_DIR, batch_id)
+        for item in reversed(batch.get("items", [])):
+            rel = item.get("rel_path", "")
+            try:
+                target = safe_join(self.allowed_folder, rel)
+            except ValueError:
+                fail_count += 1
+                continue
+            try:
+                if item.get("existed"):
+                    src = os.path.join(
+                        batch_dir, *item["backup"].split("/"))
+                    if not os.path.exists(src):
+                        fail_count += 1
+                        log_local("返回失敗：備份遺失 %s" % rel)
+                        continue
+                    parent = os.path.dirname(target)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                    shutil.copyfile(src, target)
+                else:
+                    if os.path.exists(target) \
+                            and os.path.isfile(target):
+                        os.remove(target)
+                ok_count += 1
+            except OSError as e:
+                fail_count += 1
+                log_local("返回失敗：%s（%s）" % (rel, e))
+        batch["undone"] = True
+        batch["undone_at"] = utcnow_iso()
+        try:
+            save_history(history)
+        except OSError as e:
+            log_local("儲存同步紀錄失敗：%s" % e)
+        append_activity(self.relay, {
+            "action": "undone", "ai_name": batch.get("ai_name", ""),
+            "batch_id": batch_id,
+            "detail": "已返回到同步前的狀態（%d 個檔案還原，%d 個失敗）"
+                      % (ok_count, fail_count)})
+        self.ui.add_activity({
+            "action": "undone", "ai_name": batch.get("ai_name", ""),
+            "rel_path": "", "at": utcnow_iso()})
+        self.ui.notify("AI File：已返回",
+                       "已回到同步前的狀態：%d 個檔案還原，%d 個失敗。"
+                       % (ok_count, fail_count))
+        log_local("已返回批次 %s：%d 還原，%d 失敗"
+                  % (batch_id, ok_count, fail_count))
+        return fail_count == 0
+
+    def _check_undo(self):
+        """輪詢 undo.json：管理員在網頁版按了「返回」，跳確認對話框，
+        使用者按確定才執行還原，完成後刪掉 undo.json。"""
+        try:
+            undo, _ = self.relay.get_json("undo.json")
+        except Exception:
+            return
+        if not isinstance(undo, dict) or not undo.get("batch_id"):
+            return
+        batch_id = undo["batch_id"]
+        if batch_id in self._seen_undo:
+            return
+        self._seen_undo.add(batch_id)
+        ok = self.ui.ask_yes_no(
+            "AI File：管理員要求返回",
+            "管理員在網頁版要求把一批同步返回到同步前的狀態：\n"
+            "批次 %s\n\n要執行還原嗎？\n"
+            "（被改過／刪掉的檔案從備份還原，被新增的檔案刪掉。）"
+            % batch_id)
+        if ok:
+            self.undo_batch(batch_id)
+        else:
+            append_activity(self.relay, {
+                "action": "undo-declined", "ai_name": "",
+                "batch_id": batch_id,
+                "detail": "使用者拒絕了網頁版的返回要求"})
+            log_local("使用者拒絕返回批次 %s" % batch_id)
+        try:
+            self.relay.delete("undo.json", "AI File：已處理返回要求")
+        except Exception:
+            pass
+
     def reset_data(self, wizard_fn=None):
         """重設資料：確認後停止輪詢、刪除設定與紀錄檔、重新開設定精靈。
         本機資料只有程式資料夾裡的 ai-file-config.json 和 ai-file-log.txt，
@@ -869,18 +1119,24 @@ class Agent:
             "・GitHub Token\n"
             "・允許的資料夾\n"
             "・工作階段代碼\n"
-            "・本機紀錄（ai-file-log.txt）\n\n"
+            "・本機紀錄（ai-file-log.txt）\n"
+            "・同步紀錄與備份（ai-file-history.json、ai-file-backup/）\n\n"
             "刪除後會重新打開第一次設定精靈。")
         if not ok:
             return False
         self._resetting = True
         self.stopped = True
-        for path in (CONFIG_FILE, LOG_FILE):
+        for path in (CONFIG_FILE, LOG_FILE, HISTORY_FILE):
             try:
                 if os.path.exists(path):
                     os.remove(path)
             except OSError as e:
                 log_local("刪除 %s 失敗：%s" % (path, e))
+        try:
+            if os.path.isdir(BACKUP_DIR):
+                shutil.rmtree(BACKUP_DIR, ignore_errors=True)
+        except OSError as e:
+            log_local("刪除備份資料夾失敗：%s" % e)
         # 注意：這裡不能再呼叫 log_local，否則會把剛刪的 log 檔又建回來
         print("AI File：本機資料已清除，重新開啟設定精靈")
         fn = wizard_fn or run_setup_wizard
@@ -1066,10 +1322,37 @@ class Agent:
 
     def apply_pending(self, files):
         """下載、驗證、寫入。每個檔案獨立處理，失敗的不影響其他檔案。
-        成功寫入後才從中繼清掉該筆；全部完成後更新 manifest。"""
+        成功寫入後才從中繼清掉該筆；全部完成後更新 manifest。
+        寫入任何檔案之前，先把所有受影響檔案的目前內容備份到
+        ai-file-backup/<批次 id>/，才能事後「返回」。"""
+        batch_id = new_batch_id()
+        batch_dir = os.path.join(BACKUP_DIR, batch_id)
+        history_items = []
         results = []
         remaining = []
-        for entry in files:
+        # 0. 先備份：還沒寫入任何東西之前，備份所有受影響檔案的目前內容
+        backups = {}
+        for idx, entry in enumerate(files):
+            rel = entry.get("rel_path", "")
+            try:
+                target = safe_join(self.allowed_folder, rel)
+            except ValueError:
+                backups[idx] = (False, None, "path")
+                continue
+            if os.path.isfile(target):
+                try:
+                    clean = sanitize_rel_path(rel)
+                    dest = os.path.join(batch_dir, *clean.split("/"))
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copyfile(target, dest)
+                    backups[idx] = (True, clean, None)
+                except OSError as e:
+                    backups[idx] = (False, None, "備份失敗：%s" % e)
+            elif os.path.exists(target):
+                backups[idx] = (False, None, "是資料夾，無法處理")
+            else:
+                backups[idx] = (False, None, None)
+        for idx, entry in enumerate(files):
             rel = entry.get("rel_path", "")
             action = entry.get("action", "add")
             ai_name = entry.get("ai_name", "")
@@ -1078,7 +1361,7 @@ class Agent:
             # 1. 工作階段代碼必須是當下有效的
             if entry.get("session_code") != self.session_code:
                 result["error"] = "工作階段代碼不符，已拒收"
-                self._record_reject(entry, "工作階段代碼不符")
+                self._record_reject(entry, "工作階段代碼不符", batch_id)
                 results.append(result)
                 remaining.append(entry)
                 continue
@@ -1087,9 +1370,16 @@ class Agent:
                 target = safe_join(self.allowed_folder, rel)
             except ValueError as e:
                 result["error"] = str(e)
-                self._record_reject(entry, str(e))
+                self._record_reject(entry, str(e), batch_id)
                 results.append(result)
                 continue  # 越界的直接丟掉，不留在待同步
+            # 2b. 備份失敗的檔案不寫入，留在待同步等下次
+            backup_error = backups.get(idx, (False, None, None))[2]
+            if backup_error and backup_error != "path":
+                result["error"] = backup_error
+                remaining.append(entry)
+                results.append(result)
+                continue
             # 3. 刪除
             if action == "delete":
                 try:
@@ -1099,8 +1389,13 @@ class Agent:
                 except OSError as e:
                     result["error"] = "刪除失敗：%s" % e
                     remaining.append(entry)
-                self._record_applied(entry, result)
+                self._record_applied(entry, result, batch_id)
                 results.append(result)
+                if result["ok"]:
+                    history_items.append({
+                        "rel_path": rel, "action": action,
+                        "existed": backups[idx][0],
+                        "backup": backups[idx][1]})
                 continue
             # 4. 下載並驗證雜湊
             pending_name = entry.get("file", "")
@@ -1123,7 +1418,7 @@ class Agent:
                 continue
             if sha256_bytes(data) != entry.get("sha256", ""):
                 result["error"] = "雜湊驗證失敗，檔案可能被竄改，已拒收"
-                self._record_reject(entry, "雜湊驗證失敗")
+                self._record_reject(entry, "雜湊驗證失敗", batch_id)
                 results.append(result)
                 continue
             # 5. 寫入允許的資料夾
@@ -1137,8 +1432,13 @@ class Agent:
             except OSError as e:
                 result["error"] = "寫入失敗：%s" % e
                 remaining.append(entry)
-            self._record_applied(entry, result)
+            self._record_applied(entry, result, batch_id)
             results.append(result)
+            if result["ok"]:
+                history_items.append({
+                    "rel_path": rel, "action": action,
+                    "existed": backups[idx][0],
+                    "backup": backups[idx][1]})
             # 6. 成功就從中繼刪掉暫存檔
             if result["ok"]:
                 try:
@@ -1146,6 +1446,20 @@ class Agent:
                                       "AI File：已同步，清除暫存")
                 except Exception:
                     pass
+        # 寫入同步紀錄（只記真的動到磁碟的檔案）；沒動到就不留備份
+        if history_items:
+            history = load_history()
+            history.insert(0, {
+                "id": batch_id, "at": utcnow_iso(),
+                "ai_name": files[0].get("ai_name", "") if files else "",
+                "undone": False, "items": history_items})
+            prune_history(history)
+            try:
+                save_history(history)
+            except OSError as e:
+                log_local("儲存同步紀錄失敗：%s" % e)
+        elif os.path.isdir(batch_dir):
+            shutil.rmtree(batch_dir, ignore_errors=True)
         # 更新 manifest：只留還沒成功的
         try:
             self.relay.put_json("pending/manifest.json",
@@ -1155,15 +1469,18 @@ class Agent:
             log_local("更新待同步清單失敗：%s" % e)
         return results
 
-    def _record_applied(self, entry, result):
+    def _record_applied(self, entry, result, batch_id=None):
         verb = {"add": "新增", "modify": "修改",
                 "delete": "刪除"}.get(entry.get("action", "add"), "新增")
         if result.get("ok"):
-            append_activity(self.relay, {
+            act = {
                 "action": entry.get("action", "add"),
                 "ai_name": entry.get("ai_name", ""),
                 "rel_path": entry.get("rel_path", ""),
-                "detail": "已同步"})
+                "detail": "已同步"}
+            if batch_id:
+                act["batch_id"] = batch_id
+            append_activity(self.relay, act)
             self.ui.add_activity({
                 "action": entry.get("action", "add"),
                 "ai_name": entry.get("ai_name", ""),
@@ -1171,20 +1488,26 @@ class Agent:
                 "at": utcnow_iso()})
             log_local("%s：%s" % (verb, entry.get("rel_path", "")))
         else:
-            append_activity(self.relay, {
+            act = {
                 "action": "sync-failed",
                 "ai_name": entry.get("ai_name", ""),
                 "rel_path": entry.get("rel_path", ""),
-                "detail": result.get("error", "")})
+                "detail": result.get("error", "")}
+            if batch_id:
+                act["batch_id"] = batch_id
+            append_activity(self.relay, act)
             log_local("%s失敗：%s（%s）" % (
                 verb, entry.get("rel_path", ""), result.get("error", "")))
 
-    def _record_reject(self, entry, reason):
-        append_activity(self.relay, {
+    def _record_reject(self, entry, reason, batch_id=None):
+        act = {
             "action": "rejected-path",
             "ai_name": entry.get("ai_name", ""),
             "rel_path": entry.get("rel_path", ""),
-            "detail": reason})
+            "detail": reason}
+        if batch_id:
+            act["batch_id"] = batch_id
+        append_activity(self.relay, act)
         self.ui.add_activity({
             "action": "rejected-path",
             "ai_name": entry.get("ai_name", ""),
@@ -1224,6 +1547,7 @@ class Agent:
         self.send_heartbeat()
         self._check_session()
         self._check_regen()
+        self._check_undo()
         self._check_pending()
         self._refresh_conn_status()
         if not self.stopped:
@@ -1352,6 +1676,26 @@ def run_setup_wizard(root, relay=None):
     return result
 
 
+def reset_approved_session_on_start(relay):
+    """每次啟動時：如果中繼的 session 還是上次的 approved，重設回 waiting，
+    AI 要重新取得一次「是」才行（否則重開程式就自動同意了）。"""
+    try:
+        session, _ = relay.get_json("session.json")
+    except Exception as e:
+        log_local("啟動時讀取 session.json 失敗：%s" % e)
+        return
+    if isinstance(session, dict) and session.get("status") == "approved":
+        session["status"] = "waiting"
+        session["reset_at"] = utcnow_iso()
+        try:
+            relay.put_json("session.json", session,
+                           "AI File：啟動時重設工作階段為等待")
+            log_local("啟動時把上次已允許的工作階段重設回等待"
+                      "（AI 要重新取得一次「是」）")
+        except Exception as e:
+            log_local("啟動時重設工作階段失敗：%s" % e)
+
+
 def _make_shortcut_once(cfg):
     """第一次啟動時在背景建立桌面捷徑，成功才記下來，下次不再試。"""
     if create_desktop_shortcut():
@@ -1395,6 +1739,12 @@ def main(argv):
     ui.set_code(agent.session_code)
     ui.set_status("監控中 — %s" % os.path.basename(
         os.path.normpath(agent.allowed_folder)))
+
+    # 啟動時把上次已允許的工作階段重設回等待：重開程式不等於自動同意
+    try:
+        reset_approved_session_on_start(relay)
+    except Exception:
+        pass
 
     # 第一次啟動：在背景建立桌面捷徑（失敗就靜默，只寫 log）
     if not cfg.get("shortcut_created"):
@@ -1471,7 +1821,11 @@ def run_core_check():
                        parse_version("1.10") > parse_version("1.2")))
         checks.append(("版本比對：1.2 == 1.2",
                        parse_version("1.2") == parse_version("1.2")))
-        checks.append(("VERSION 是 1.2", VERSION == "1.2"))
+        bid = new_batch_id()
+        checks.append(("備份批次 id 格式",
+                       len(bid) == 20 and bid[8] == "-"
+                       and bid[15] == "-"))
+        checks.append(("VERSION 是 1.3", VERSION == "1.3"))
     except Exception as e:
         print("檢查出錯：%s" % e)
         return 1

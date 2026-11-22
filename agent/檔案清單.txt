@@ -1,25 +1,28 @@
-AI File v1.2 — 檔案清單
+AI File v1.3 — 檔案清單
 ========================
 
 根目錄
   agent.md              專案說明（架構、安全模型、流程、版本歷史）
   README.md             安裝與使用說明
-  VERSION               版本號（目前是 1.2）
-  .gitignore            ai-file-config.json、ai-file-log.txt 絕不進版控
+  VERSION               版本號（目前是 1.3）
+  .gitignore            ai-file-config.json、ai-file-log.txt、ai-file-history.json、
+                        ai-file-backup/ 絕不進版控
   index.html            GitHub Pages 網站（靜態 SPA，全部繁體中文）
   app.js                呼叫 GitHub API 讀寫中繼 repo（金鑰只存瀏覽器 localStorage）
   style.css             介面樣式
 
 agent/（Windows 本地端，Python 標準函式庫，不用 pip）
   ai_file_agent.py      本地端主程式：設定精靈、輪詢、通知、浮動視窗、立即同步、
-                        桌面捷徑、自動更新、連線狀態、重設資料
+                        桌面捷徑、自動更新、連線狀態、重設資料、備份與返回
   啟動 AI File.bat      主要啟動器（pythonw.exe，不跳黑視窗）
   啟動 AI File.vbs      備援啟動器（也是桌面捷徑的目標）
   自我檢查.py           自我檢查：設定檔、路徑守門、雜湊驗證、停止旗標、同步流程、
-                        版本比對、連線診斷
+                        版本比對、連線診斷、備份與返回
   檔案清單.txt          就是這個檔案
 
 啟動後才會產生的檔案（只存本機，不在 repo 裡）
   ai-file-config.json   你的 PAT、允許的資料夾、工作階段代碼（在 agent/ 資料夾）
   ai-file-log.txt       本機同步紀錄（在 agent/ 資料夾）
+  ai-file-history.json  同步紀錄（批次 id、時間、AI 名稱、每批變更，只留最近 20 批）
+  ai-file-backup/       同步前的檔案備份（每批一個資料夾，只留最近 20 批）
   更新 AI File.bat      自動更新時才產生：覆蓋 agent/ 後重啟，跑完自己刪除

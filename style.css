@@ -134,7 +134,59 @@ textarea { resize: vertical; }
   font-size: 13px;
   padding: 18px 0 28px;
 }
+.footer p { margin: 0 0 10px; }
+
+/* 進入畫面：左 AI、右管理員 */
+.landing-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.landing-card { margin-bottom: 0; text-align: center; }
+.landing-card h2 { font-size: 22px; }
+.landing-card p { text-align: left; }
+.landing-pat { text-align: center; margin: 12px 0 4px; }
+.btn-big { font-size: 17px; padding: 12px 28px; }
+
+/* 說明對話框 */
+.modal { position: fixed; inset: 0; z-index: 50; }
+.modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+}
+.modal-box {
+  position: relative;
+  max-width: 720px;
+  max-height: 86vh;
+  overflow-y: auto;
+  margin: 5vh auto;
+  background: var(--card);
+  border-radius: 12px;
+  padding: 20px 24px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+.modal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.modal-head h2 { margin: 0; }
+
+/* 清單裡的小按鈕（取消暫存、返回） */
+.btn-small {
+  padding: 4px 10px;
+  font-size: 13px;
+  margin-left: 8px;
+  white-space: nowrap;
+}
+.list li .actions { display: inline; }
+.batch-head { font-weight: 700; }
+.batch-undone { color: var(--muted); }
+
 @media (max-width: 600px) {
   .kv div { flex-direction: column; gap: 0; }
   .kv dt { width: auto; }
+  .landing-grid { grid-template-columns: 1fr; }
+  .modal-box { margin: 3vh 12px; max-height: 92vh; }
 }

@@ -1,10 +1,18 @@
-/* AI File v1.2 — 網頁版
+/* AI File v1.3 — 網頁版
  * 靜態 SPA，跑在 GitHub Pages 上，沒有後端伺服器。
  * GitHub 金鑰只由管理員設定一次，存在瀏覽器 localStorage（aifile_pat）；
  * AI 登入只要工作階段代碼，不用再貼金鑰。
  * 絕對不要把任何 Token、密碼寫死在程式碼裡。
  * 網頁只能把檔案「暫存」到私人中繼 repo，真正寫進電腦的動作
  * 永遠由本地端程式在使用者按「同意」後才做。
+ *
+ * v1.3 改動：
+ * - 進入畫面是左 AI、右管理員兩張大卡片；連線狀態登入後才出現；
+ *   下載與怎麼用收進「說明」對話框；登出在頁面最下方。
+ * - 金鑰儲存加防護：寫入失敗會明確報錯；進畫面就顯示金鑰狀態；
+ *   載入時檢查瀏覽器能不能存網站資料。
+ * - 待同步可以「取消暫存」；頁面重開不再自動還原已允許的 AI 工作階段。
+ * - 異動紀錄按同步批次分組，每批可以「返回」（寫 undo.json 等本地端確認）。
  */
 "use strict";
 
@@ -146,35 +154,49 @@ function appendActivity(pat, entry) {
   });
 }
 
+/* ---------- localStorage 安全讀寫 ---------- */
+// 金鑰消失的真正原因（v1.3 查核）：程式碼從來沒有刪過 aifile_pat，登出也只清
+// aifile_ai。金鑰是瀏覽器本身沒留住：換瀏覽器、無痕視窗、關閉時清除網站資料、
+// 或是不保留資料的雲端瀏覽器。另外 v1.2 有個小缺口：setItem 失敗會靜默丟例外，
+// 使用者看不到「其實沒存下來」。下面全部用 try/catch 包起來，失敗就明講。
+function storageAvailable() {
+  try {
+    localStorage.setItem("aifile_storage_test", "1");
+    var ok = localStorage.getItem("aifile_storage_test") === "1";
+    localStorage.removeItem("aifile_storage_test");
+    return ok;
+  } catch (e) { return false; }
+}
+function loadStoredPat() {
+  try { return localStorage.getItem("aifile_pat") || ""; }
+  catch (e) { return ""; }
+}
+
 /* ---------- 狀態 ---------- */
 var state = {
-  pat: localStorage.getItem("aifile_pat") || "",
+  pat: loadStoredPat(),
   adminAuthed: false,
-  ai: null,          // {name, code}：金鑰不再存在 AI 登入裡
+  ai: null,          // {name, code}：只在這次頁面登入後才有；重開頁面不自動還原
   sessionPoll: null,
   statusTimer: null
 };
-try {
-  var savedAi = JSON.parse(localStorage.getItem("aifile_ai") || "null");
-  if (savedAi && savedAi.name && savedAi.code) {
-    // v1.2：舊版存過 pat 的瀏覽器自動清掉，只留名稱和代碼
-    if (savedAi.pat) {
-      delete savedAi.pat;
-      localStorage.setItem("aifile_ai", JSON.stringify(savedAi));
-    }
-    state.ai = { name: savedAi.name, code: savedAi.code };
-  }
-} catch (e) { /* 忽略損壞的暫存 */ }
 
 // 金鑰只從管理員設定讀（localStorage aifile_pat），AI 登入不再帶金鑰
 function pat() { return state.pat || ""; }
 function savePat(p) {
-  state.pat = p;
-  localStorage.setItem("aifile_pat", p);
+  try {
+    localStorage.setItem("aifile_pat", p);
+    state.pat = p;
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
-/* ---------- 連線狀態（每 30 秒讀 heartbeat.json） ---------- */
+/* ---------- 連線狀態（登入後才開始每 30 秒讀 heartbeat.json） ---------- */
 function refreshStatus() {
+  // 還沒登入就不顯示也不讀：登入前看不到連線狀態
+  if (!state.adminAuthed && !state.ai) return Promise.resolve();
   var p = pat();
   if (!p) {
     setStatus("grey", "尚未設定金鑰", "請管理員先在管理員介面設定 GitHub 金鑰（只需設定一次）。");
@@ -213,11 +235,54 @@ function setStatus(color, text, hint) {
   $("status-text").textContent = text;
   $("status-hint").textContent = hint || "";
 }
+function startStatusTimer() {
+  if (state.statusTimer) return;
+  state.statusTimer = setInterval(function () {
+    refreshStatus();
+    if (state.adminAuthed) { refreshPending(); refreshActivity(); refreshStopState(); }
+  }, 30000);
+}
+function stopStatusTimer() {
+  if (state.statusTimer) { clearInterval(state.statusTimer); state.statusTimer = null; }
+}
+function showStatusCard() { show($("status-card")); }
+
+/* ---------- 進入畫面 ---------- */
+function showLanding() {
+  show($("landing"));
+  hide($("admin-panel")); hide($("ai-panel"));
+  hide($("admin-auth")); hide($("ai-auth")); hide($("status-card"));
+}
+function enterAi() {
+  hide($("landing")); hide($("admin-auth")); hide($("admin-panel"));
+  clearNotice();
+  if (state.ai) {
+    show($("ai-panel"));
+    $("ai-session-state").textContent = "工作階段狀態：已登入（" + state.ai.name + "）";
+    refreshMyStaged(); pollSession();
+  } else {
+    show($("ai-auth"));
+  }
+}
+function enterAdmin() {
+  hide($("landing")); hide($("ai-auth")); hide($("ai-panel"));
+  clearNotice();
+  if (state.adminAuthed) {
+    show($("admin-panel")); loadAdminData();
+  } else {
+    openAdminAuth();
+  }
+}
+function openHelp() { show($("help-dialog")); }
+function closeHelp() { hide($("help-dialog")); }
 
 /* ---------- 管理員：帳號密碼（只鎖這個瀏覽器的介面） ---------- */
-function adminHashExists() { return !!localStorage.getItem("aifile_admin_hash"); }
+function adminHashExists() {
+  try { return !!localStorage.getItem("aifile_admin_hash"); }
+  catch (e) { return false; }
+}
 function openAdminAuth() {
-  hide($("ai-auth")); hide($("ai-panel"));
+  hide($("ai-auth")); hide($("ai-panel")); hide($("landing"));
   show($("admin-auth"));
   if (adminHashExists()) {
     hide($("admin-setup")); show($("admin-login"));
@@ -234,8 +299,12 @@ function setupAdmin() {
   if (!p1) return notice("請輸入密碼。", "err");
   if (p1 !== p2) return notice("兩次輸入的密碼不一樣。", "err");
   sha256Hex(p1).then(function (h) {
-    localStorage.setItem("aifile_admin_user", user);
-    localStorage.setItem("aifile_admin_hash", h);
+    try {
+      localStorage.setItem("aifile_admin_user", user);
+      localStorage.setItem("aifile_admin_hash", h);
+    } catch (e) {
+      return notice("帳號存不下來：這個瀏覽器拒絕寫入網站資料，請改用一般視窗再試一次。", "err");
+    }
     state.adminAuthed = true;
     $("admin-user").textContent = user;
     hide($("admin-auth")); show($("admin-panel"));
@@ -246,8 +315,13 @@ function setupAdmin() {
 function loginAdmin() {
   var user = $("login-user").value.trim();
   var pass = $("login-pass").value;
-  var savedUser = localStorage.getItem("aifile_admin_user");
-  var savedHash = localStorage.getItem("aifile_admin_hash");
+  var savedUser, savedHash;
+  try {
+    savedUser = localStorage.getItem("aifile_admin_user");
+    savedHash = localStorage.getItem("aifile_admin_hash");
+  } catch (e) {
+    return notice("讀不到管理員帳號：這個瀏覽器不保留網站資料，請改用一般視窗。", "err");
+  }
   sha256Hex(pass).then(function (h) {
     if (user === savedUser && h === savedHash) {
       state.adminAuthed = true;
@@ -263,16 +337,30 @@ function loginAdmin() {
 
 /* ---------- 管理員：GitHub 金鑰設定（只設定一次） ---------- */
 function updatePatState() {
+  var text = state.pat ? "已設定" : "未設定";
   var el = $("pat-state");
-  if (el) el.textContent = state.pat ? "已設定" : "未設定";
+  if (el) el.textContent = text;
+  var landing = $("landing-pat-state");
+  if (landing) landing.textContent = text;
 }
 function savePatKey() {
   var v = $("admin-pat-setup").value.trim();
   if (!v) return notice("請先貼上 GitHub 細粒度 Token。", "err");
-  savePat(v);
+  if (!savePat(v)) {
+    return notice("金鑰沒有存下來：這個瀏覽器拒絕寫入網站資料（可能是無痕模式或儲存空間已滿）。請改用一般視窗再試一次。", "err");
+  }
   $("admin-pat-setup").value = "";
   updatePatState();
   notice("GitHub 金鑰已設定（只存在這個瀏覽器）。之後 AI 登入只要工作階段代碼，不用再貼金鑰。", "ok");
+  refreshStatus();
+}
+function clearPatKey() {
+  if (!state.pat && !loadStoredPat()) return notice("本來就沒有設定金鑰。", "info");
+  if (!confirm("確定要清除這個瀏覽器裡的 GitHub 金鑰嗎？清除後 AI 登入和連線狀態都會失效，要重新設定。")) return;
+  try { localStorage.removeItem("aifile_pat"); } catch (e) {}
+  state.pat = "";
+  updatePatState();
+  notice("已清除金鑰。", "info");
   refreshStatus();
 }
 function testConnection() {
@@ -297,16 +385,13 @@ function testConnection() {
 
 /* ---------- 管理員介面 ---------- */
 function loadAdminData() {
+  showStatusCard();
   updatePatState();
   refreshStatus();
   refreshPending();
   refreshActivity();
   refreshStopState();
-  if (!state.statusTimer) {
-    state.statusTimer = setInterval(function () {
-      refreshStatus(); refreshPending(); refreshActivity(); refreshStopState();
-    }, 30000);
-  }
+  startStatusTimer();
 }
 function refreshStopState() {
   var p = pat();
@@ -317,6 +402,53 @@ function refreshStopState() {
     if (stopped) { hide($("btn-stop")); show($("btn-resume")); }
     else { show($("btn-stop")); hide($("btn-resume")); }
   }).catch(function () { /* 狀態列已顯示錯誤 */ });
+}
+// 暫存項目的比對鍵：有 id 用 id，舊資料用 rel_path＋時間＋AI 名稱
+function entryKey(f) {
+  if (f.id) return "id:" + f.id;
+  return "k:" + (f.rel_path || "") + "|" + (f.time || "") + "|" + (f.ai_name || "");
+}
+function cancelButton(f, isAdmin) {
+  var btn = document.createElement("button");
+  btn.className = "btn btn-outline btn-small";
+  btn.textContent = "取消暫存";
+  btn.addEventListener("click", function () { cancelStaged(entryKey(f), isAdmin); });
+  return btn;
+}
+// 取消一筆暫存：從 manifest 移除，檔案型的再刪 pending/ 裡的 blob，並寫活動紀錄
+function cancelStaged(key, isAdmin) {
+  var p = pat();
+  if (!p) return notice("請先設定 GitHub 金鑰。", "err");
+  if (!confirm("確定要取消這筆暫存嗎？本地端還沒同步的檔案不會寫進電腦。")) return;
+  ghGetJson(p, "pending/manifest.json").then(function (r) {
+    var files = (r.data && r.data.files) || [];
+    var target = null;
+    var rest = files.filter(function (f) {
+      if (entryKey(f) === key) { target = f; return false; }
+      return true;
+    });
+    if (!target) throw new Error("這筆暫存已經不在清單裡（可能已經同步或被取消了）。");
+    if (!isAdmin && (!state.ai || target.ai_name !== state.ai.name)) {
+      throw new Error("只能取消自己的暫存項目。");
+    }
+    var delBlob = target.file
+      ? ghDeleteFile(p, "pending/" + target.file, "AI File：取消暫存，刪除暫存檔")
+      : Promise.resolve();
+    return delBlob.then(function () {
+      return ghPutJson(p, "pending/manifest.json", { files: rest }, "AI File：取消一筆暫存");
+    }).then(function () {
+      return appendActivity(p, {
+        action: "cancelled-staged",
+        ai_name: state.ai ? state.ai.name : "",
+        rel_path: target.rel_path,
+        detail: "已取消暫存"
+      });
+    });
+  }).then(function () {
+    notice("已取消暫存。", "ok");
+    refreshMyStaged();
+    if (state.adminAuthed) refreshPending();
+  }).catch(function (e) { notice(String(e.message || e), "err"); });
 }
 function refreshPending() {
   var p = pat();
@@ -337,10 +469,23 @@ function refreshPending() {
       meta.className = "meta";
       meta.textContent = (f.ai_name || "") + " · " + (f.time || "") + (f.size ? " · " + f.size + " bytes" : "");
       li.appendChild(meta);
+      var actions = document.createElement("span");
+      actions.className = "actions";
+      actions.appendChild(cancelButton(f, true));
+      li.appendChild(actions);
       ul.appendChild(li);
     });
   }).catch(function () { /* 忽略，狀態列會顯示 */ });
 }
+var ACTION_NAMES = {
+  add: "新增", modify: "修改", delete: "刪除",
+  "session-approved": "已允許連線", "session-rejected": "已拒絕連線",
+  "rejected-path": "已拒絕越界", stopped: "已停止", resumed: "已恢復",
+  "code-regenerated": "代碼已重新生成", synced: "已同步",
+  "sync-failed": "同步失敗", "cancelled-staged": "已取消暫存",
+  undone: "已返回", "undo-requested": "要求返回"
+};
+// 管理員異動紀錄：同一批同步（同 batch_id）整理成一組，每組可以「返回」
 function refreshActivity() {
   var p = pat();
   if (!p) return;
@@ -352,23 +497,74 @@ function refreshActivity() {
       ul.innerHTML = "<li class='hint'>還沒有紀錄。</li>";
       return;
     }
-    list.slice(-50).reverse().forEach(function (e) {
-      var li = document.createElement("li");
-      var action = {
-        add: "新增", modify: "修改", delete: "刪除",
-        "session-approved": "已允許連線", "session-rejected": "已拒絕連線",
-        "rejected-path": "已拒絕越界", stopped: "已停止",
-        "code-regenerated": "代碼已重新生成", synced: "已同步",
-        "sync-failed": "同步失敗"
-      }[e.action] || e.action;
-      li.textContent = "[" + action + "] " + (e.rel_path || e.detail || "");
-      var meta = document.createElement("span");
-      meta.className = "meta";
-      meta.textContent = (e.ai_name || "") + " · " + (e.at || "");
-      li.appendChild(meta);
-      ul.appendChild(li);
+    var renderedBatches = {};
+    // 由新到舊：遇到某批的第一筆就把整批一起畫出來
+    list.slice().reverse().forEach(function (e) {
+      if (e.batch_id) {
+        if (renderedBatches[e.batch_id]) return;
+        renderedBatches[e.batch_id] = true;
+        var batchEntries = list.filter(function (x) { return x.batch_id === e.batch_id; });
+        var undone = batchEntries.some(function (x) { return x.action === "undone"; });
+        var undoRequested = batchEntries.some(function (x) { return x.action === "undo-requested"; });
+        var items = batchEntries.filter(function (x) {
+          return x.action !== "undone" && x.action !== "undo-requested";
+        });
+        var first = items[0] || batchEntries[0];
+        var li = document.createElement("li");
+        var head = document.createElement("div");
+        head.className = "batch-head";
+        head.textContent = "同步批次 " + e.batch_id + " · " + (first.ai_name || "") + " · " + (first.at || "");
+        li.appendChild(head);
+        items.forEach(function (x) {
+          var div = document.createElement("div");
+          div.textContent = "[" + (ACTION_NAMES[x.action] || x.action) + "] " + (x.rel_path || x.detail || "");
+          li.appendChild(div);
+        });
+        var foot = document.createElement("div");
+        if (undone) {
+          foot.textContent = "已返回";
+          foot.className = "batch-undone";
+        } else if (undoRequested) {
+          foot.textContent = "已送出返回，等本地端確認";
+          foot.className = "batch-undone";
+        } else {
+          var btn = document.createElement("button");
+          btn.className = "btn btn-outline btn-small";
+          btn.textContent = "返回";
+          btn.addEventListener("click", function () { requestUndo(e.batch_id); });
+          foot.appendChild(btn);
+        }
+        li.appendChild(foot);
+        ul.appendChild(li);
+      } else {
+        var li2 = document.createElement("li");
+        li2.textContent = "[" + (ACTION_NAMES[e.action] || e.action) + "] " + (e.rel_path || e.detail || "");
+        var meta = document.createElement("span");
+        meta.className = "meta";
+        meta.textContent = (e.ai_name || "") + " · " + (e.at || "");
+        li2.appendChild(meta);
+        ul.appendChild(li2);
+      }
     });
   }).catch(function () { /* 忽略 */ });
+}
+// 管理員要求返回一批同步：寫 undo.json，本地端看到會跳確認，使用者按確定才還原
+function requestUndo(batchId) {
+  var p = pat();
+  if (!p) return notice("請先設定 GitHub 金鑰。", "err");
+  if (!confirm("確定要把這批同步返回到同步前的狀態嗎？\n本地端會跳出確認，你按確定後才會真的還原。")) return;
+  ghPutJson(p, "undo.json", { batch_id: batchId, by: "web", at: utcnow() }, "AI File：管理員要求返回一批同步")
+    .then(function () {
+      return appendActivity(p, {
+        action: "undo-requested", ai_name: "",
+        batch_id: batchId, detail: "管理員在網頁版要求返回這批同步"
+      });
+    })
+    .then(function () {
+      notice("已送出返回要求，等本地端確認。", "ok");
+      refreshActivity();
+    })
+    .catch(function (e) { notice(String(e.message || e), "err"); });
 }
 function regenCode() {
   var p = pat();
@@ -416,7 +612,10 @@ function aiLogin() {
     });
   }).then(function () {
     state.ai = { name: name, code: code };
-    localStorage.setItem("aifile_ai", JSON.stringify(state.ai));
+    try {
+      // 只存名稱和代碼，下次開頁面只預填欄位，絕對不自動還原登入
+      localStorage.setItem("aifile_ai", JSON.stringify(state.ai));
+    } catch (e) { /* 存不下來也沒關係，下次再填一次就好 */ }
     notice("已送出連線請求，請等使用者在他的電腦上按「是」。", "info");
     $("ai-session-state").textContent = "工作階段狀態：等待使用者按「是」…";
     pollSession();
@@ -432,6 +631,8 @@ function pollSession() {
         clearInterval(state.sessionPoll);
         $("ai-session-state").textContent = "工作階段狀態：已允許，可以開始暫存檔案。";
         show($("ai-panel"));
+        showStatusCard();
+        startStatusTimer();
         refreshStatus();
         notice("使用者已按「是」，可以開始暫存檔案了。", "ok");
       } else if (s.status === "stopped") {
@@ -476,8 +677,11 @@ function pendingFileName(rel, index, sha) {
   var base = rel.split("/").pop().replace(/ /g, "_").replace(/[^A-Za-z0-9._-]/g, "") || "file";
   return String(index).padStart(3, "0") + "_" + sha.slice(0, 12) + "_" + base;
 }
+function newStageId() {
+  return "st-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
 function stageEntry(entry, fileB64) {
-  // entry: {rel_path, action, sha256, size, file(pending 名稱或 null)}
+  // entry: {id, rel_path, action, sha256, size, file(pending 名稱或 null)}
   var p = pat();
   var putFile = entry.file
     ? ghPutFile(p, "pending/" + entry.file, fileB64, "AI File：" + state.ai.name + " 暫存 " + entry.rel_path)
@@ -515,6 +719,7 @@ function stageFiles(fileList, relPathHint) {
           var bytes = new Uint8Array(reader.result);
           sha256Hex(bytes).then(function (hash) {
             var entry = {
+              id: newStageId(),
               rel_path: rel,
               file: pendingFileName(rel, Date.now() % 1000, hash),
               action: "add",
@@ -551,6 +756,7 @@ function stagePaste() {
     var bytes = new TextEncoder().encode(content);
     return sha256Hex(bytes).then(function (hash) {
       var entry = {
+        id: newStageId(),
         rel_path: rel,
         file: pendingFileName(rel, Date.now() % 1000, hash),
         action: "add",
@@ -577,6 +783,7 @@ function stageDelete() {
   if (!confirm("確定要請使用者刪除「" + rel + "」嗎？使用者在電腦上按「同意」後才會真的刪除。")) return;
   checkStagingReady().then(function () {
     var entry = {
+      id: newStageId(),
       rel_path: rel, file: null, action: "delete", sha256: "", size: 0,
       ai_name: state.ai.name, time: utcnow(), session_code: state.ai.code
     };
@@ -608,42 +815,39 @@ function refreshMyStaged() {
       meta.className = "meta";
       meta.textContent = (f.time || "") + " · 等待使用者同意同步";
       li.appendChild(meta);
+      var actions = document.createElement("span");
+      actions.className = "actions";
+      actions.appendChild(cancelButton(f, false));
+      li.appendChild(actions);
       ul.appendChild(li);
     });
   }).catch(function () { /* 忽略 */ });
 }
 
 /* ---------- 事件綁定 ---------- */
-$("btn-admin").addEventListener("click", function () {
-  if (state.adminAuthed) {
-    hide($("ai-auth")); hide($("ai-panel")); hide($("admin-auth"));
-    show($("admin-panel")); loadAdminData();
-  } else {
-    openAdminAuth();
-  }
-});
-$("btn-ai").addEventListener("click", function () {
-  hide($("admin-auth")); hide($("admin-panel"));
-  if (state.ai) {
-    show($("ai-panel"));
-    $("ai-name").value = state.ai.name;
-    $("ai-code").value = state.ai.code;
-    $("ai-session-state").textContent = "工作階段狀態：已登入（" + state.ai.name + "）";
-    refreshMyStaged(); pollSession();
-  } else {
-    show($("ai-auth"));
-  }
+$("btn-enter-ai").addEventListener("click", enterAi);
+$("btn-enter-admin").addEventListener("click", enterAdmin);
+$("btn-help").addEventListener("click", openHelp);
+$("help-close").addEventListener("click", closeHelp);
+$("help-backdrop").addEventListener("click", closeHelp);
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape") closeHelp();
 });
 $("btn-logout").addEventListener("click", function () {
   state.adminAuthed = false; state.ai = null;
-  localStorage.removeItem("aifile_ai");
-  if (state.sessionPoll) clearInterval(state.sessionPoll);
-  hide($("admin-panel")); hide($("ai-panel")); hide($("admin-auth")); hide($("ai-auth"));
+  try { localStorage.removeItem("aifile_ai"); } catch (e) {}
+  if (state.sessionPoll) { clearInterval(state.sessionPoll); state.sessionPoll = null; }
+  stopStatusTimer();
+  showLanding();
+  $("ai-name").value = "";
+  $("ai-code").value = "";
+  updatePatState();
   notice("已登出。GitHub 金鑰仍留在瀏覽器裡（管理員設定），下次不用重設。", "info");
 });
 $("btn-setup-admin").addEventListener("click", setupAdmin);
 $("btn-login-admin").addEventListener("click", loginAdmin);
 $("btn-save-pat").addEventListener("click", savePatKey);
+$("btn-clear-pat").addEventListener("click", clearPatKey);
 $("btn-test-conn").addEventListener("click", testConnection);
 $("btn-regen").addEventListener("click", regenCode);
 $("btn-stop").addEventListener("click", function () { setStopped(true); });
@@ -657,16 +861,19 @@ $("btn-stage-paste").addEventListener("click", stagePaste);
 $("btn-stage-delete").addEventListener("click", stageDelete);
 
 /* ---------- 啟動 ---------- */
-if (state.ai) {
-  show($("btn-logout"));
-  show($("ai-panel"));
-  $("ai-name").value = state.ai.name;
-  $("ai-code").value = state.ai.code;
-  $("ai-session-state").textContent = "工作階段狀態：已登入（" + state.ai.name + "）";
-  refreshMyStaged();
-  pollSession();
-}
-if (adminHashExists() && state.pat) { /* 管理員已設定過，點右上角登入即可 */ }
+// 只把名稱和代碼預填進欄位，絕對不自動還原已允許的工作階段：
+// 使用者每次都要再按一次「AI 登入」，重新寫 status "waiting" 等電腦按「是」。
+try {
+  var savedAi = JSON.parse(localStorage.getItem("aifile_ai") || "null");
+  if (savedAi && savedAi.name && savedAi.code) {
+    $("ai-name").value = savedAi.name;
+    $("ai-code").value = savedAi.code;
+  }
+} catch (e) { /* 忽略損壞的暫存 */ }
 updatePatState();
-refreshStatus();
-state.statusTimer = state.statusTimer || setInterval(refreshStatus, 30000);
+if (!storageAvailable()) {
+  var lp = $("landing-pat-state");
+  if (lp) lp.textContent = "無法儲存（這個瀏覽器不保留網站資料）";
+  notice("這個瀏覽器無法儲存 GitHub 金鑰（可能是無痕模式或已停用網站資料儲存），關掉後要重新設定。請改用一般視窗的 Chrome 或 Edge。", "err");
+}
+// 注意：這裡不呼叫 refreshStatus、也不啟動定時刷新；連線狀態要登入後才出現。
