@@ -6,13 +6,12 @@
  * 網頁只能把檔案「暫存」到私人中繼 repo，真正寫進電腦的動作
  * 永遠由本地端程式在使用者按「同意」後才做。
  *
- * v1.3 改動：
- * - 進入畫面是左 AI、右管理員兩張大卡片；連線狀態登入後才出現；
- *   下載與怎麼用收進「說明」對話框；登出在頁面最下方。
- * - 金鑰儲存加防護：寫入失敗會明確報錯；進畫面就顯示金鑰狀態；
- *   載入時檢查瀏覽器能不能存網站資料。
- * - 待同步可以「取消暫存」；頁面重開不再自動還原已允許的 AI 工作階段。
- * - 異動紀錄按同步批次分組，每批可以「返回」（寫 undo.json 等本地端確認）。
+ * v1.4 改動：
+ * - 管理員介面新增「檔案總管」：看快照裡的資料夾與檔案（副檔名、
+ *   建立時間、大小、種類），電腦開著可要求即時重新整理；上傳、
+ *   編輯、刪除、重新命名都走 manifest 暫存，電腦按「同意」才套用。
+ * - 管理員暫存的項目（by="admin"）不用等工作階段核准，但一樣要
+ *   按「同意」才套用；重新命名走新的 action:"rename"。
  */
 "use strict";
 
@@ -20,6 +19,12 @@ var RELAY_OWNER = "Pagani-pagani";
 var RELAY_REPO = "ai-file-relay";
 var API_BASE = "https://api.github.com/repos/" + RELAY_OWNER + "/" + RELAY_REPO + "/contents";
 var HEARTBEAT_FRESH_SECS = 90;
+
+// 檔案總管：文字編輯白名單、編輯上限 200KB、索取檔案內容上限 10MB、等電腦回應最多 30 秒
+var TEXT_EDIT_EXTS = ["txt", "md", "json", "js", "py", "html", "css", "csv", "log", "xml", "ini", "bat", "ps1"];
+var TEXT_EDIT_MAX_BYTES = 200 * 1024;
+var CONTENT_MAX_BYTES = 10 * 1024 * 1024;
+var EXPLORER_WAIT_MS = 30000;
 
 var $ = function (id) { return document.getElementById(id); };
 function show(el) { el.classList.remove("hidden"); }
@@ -177,6 +182,7 @@ var state = {
   pat: loadStoredPat(),
   adminAuthed: false,
   ai: null,          // {name, code}：只在這次頁面登入後才有；重開頁面不自動還原
+  sessionCode: "",   // 目前的工作階段代碼（從心跳讀來，管理員暫存時帶上）
   sessionPoll: null,
   statusTimer: null
 };
@@ -225,7 +231,10 @@ function refreshStatus() {
     $("kv-version").textContent = hb.version ? ("v" + hb.version) : "—";
     $("kv-heartbeat").textContent = hb.updated_at.replace("T", " ").replace("Z", " UTC");
     $("ai-folder").textContent = hb.folder_name || hb.allowed_folder || "—";
-    if (hb.session_code) $("session-code").textContent = hb.session_code;
+    if (hb.session_code) {
+      $("session-code").textContent = hb.session_code;
+      state.sessionCode = hb.session_code;
+    }
   }).catch(function (e) {
     setStatus("red", "連線失敗", String(e.message || e));
   });
@@ -391,6 +400,7 @@ function loadAdminData() {
   refreshPending();
   refreshActivity();
   refreshStopState();
+  refreshExplorer(true);
   startStatusTimer();
 }
 function refreshStopState() {
@@ -478,7 +488,7 @@ function refreshPending() {
   }).catch(function () { /* 忽略，狀態列會顯示 */ });
 }
 var ACTION_NAMES = {
-  add: "新增", modify: "修改", delete: "刪除",
+  add: "新增", modify: "修改", delete: "刪除", rename: "重新命名",
   "session-approved": "已允許連線", "session-rejected": "已拒絕連線",
   "rejected-path": "已拒絕越界", stopped: "已停止", resumed: "已恢復",
   "code-regenerated": "代碼已重新生成", synced: "已同步",
@@ -589,6 +599,631 @@ function setStopped(stopped) {
     .catch(function (e) { notice(String(e.message || e), "err"); });
 }
 
+/* ---------- 檔案總管（管理員介面） ----------
+ * 內容來自中繼的 snapshot.json（本地端每次啟動、每次更新完都會產生）。
+ * 電腦開著時，「重新整理」與打開檔案總管會寫 list_request.json，
+ * 本地端看到就重新產生快照；電腦沒開就顯示上次的快照。
+ * 這裡的所有操作（上傳、編輯、刪除、重新命名）都只是「暫存」進
+ * manifest，電腦上按「同意」才會真的套用，絕對不繞過。
+ * 管理員暫存的項目帶 by="admin"：不用等工作階段核准（使用者本人
+ * 在同步確認窗按「同意」本身就是授權），但停止旗標開啟時一樣拒絕。
+ */
+var explorer = {
+  snapshot: null,    // snapshot.json 的內容
+  online: false,     // 心跳新鮮（90 秒內）
+  currentPath: "",   // 目前資料夾（相對路徑，根目錄是 ""）
+  search: "",
+  multiselect: false,
+  selected: {}       // rel_path -> true
+};
+
+/* 純函式（方便單元測試）：大小、時間、篩選、排序 */
+function formatSize(bytes) {
+  if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MB";
+  return (bytes / 1024).toFixed(1) + " KB";
+}
+function formatDateTime(iso) {
+  if (!iso) return "—";
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  function p(n) { return String(n).padStart(2, "0"); }
+  return d.getFullYear() + "/" + p(d.getMonth() + 1) + "/" + p(d.getDate()) +
+    " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+function explorerChildren(snapshot, path) {
+  var prefix = path ? path + "/" : "";
+  var out = [];
+  (snapshot.entries || []).forEach(function (e) {
+    if (e.path.indexOf(prefix) !== 0) return;
+    var rest = e.path.slice(prefix.length);
+    if (!rest || rest.indexOf("/") !== -1) return;
+    out.push(e);
+  });
+  return out;
+}
+function explorerSearch(snapshot, query) {
+  var q = String(query || "").toLowerCase();
+  return (snapshot.entries || []).filter(function (e) {
+    var name = e.path.split("/").pop().toLowerCase();
+    return name.indexOf(q) !== -1;
+  });
+}
+function explorerSort(entries) {
+  return entries.slice().sort(function (a, b) {
+    if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
+    var an = a.path.split("/").pop(), bn = b.path.split("/").pop();
+    return an.localeCompare(bn, "zh-Hant");
+  });
+}
+function countInside(snapshot, dirPath) {
+  var prefix = dirPath + "/";
+  var n = 0;
+  (snapshot.entries || []).forEach(function (e) {
+    if (e.path.indexOf(prefix) === 0 && !e.is_dir) n++;
+  });
+  return n;
+}
+function explorerBadgeText() {
+  if (!explorer.snapshot) return "尚未載入";
+  var gen = explorer.snapshot.generated_at;
+  if (explorer.online && gen) {
+    var age = (Date.now() - new Date(gen).getTime()) / 1000;
+    if (age <= 120) return "即時";
+  }
+  return "快照：" + formatDateTime(gen);
+}
+function isHeartbeatFresh(hb) {
+  if (!hb || hb.status === "never" || !hb.updated_at) return false;
+  return (Date.now() - new Date(hb.updated_at).getTime()) / 1000 <= HEARTBEAT_FRESH_SECS;
+}
+
+/* 載入快照：電腦在線且要求即時時，先寫 list_request.json 等新快照 */
+function refreshExplorer(requestFresh) {
+  var p = pat();
+  if (!p || !state.adminAuthed) return Promise.resolve();
+  return ghGetJson(p, "heartbeat.json").then(function (r) {
+    explorer.online = isHeartbeatFresh(r.data);
+    if (r.data && r.data.session_code) state.sessionCode = r.data.session_code;
+    if (explorer.online && requestFresh) {
+      return requestFreshSnapshot().then(function () { return loadSnapshot(); });
+    }
+    return loadSnapshot();
+  }).catch(function () {
+    explorer.online = false;
+    return loadSnapshot();
+  });
+}
+function loadSnapshot() {
+  var p = pat();
+  return ghGetJson(p, "snapshot.json").then(function (r) {
+    explorer.snapshot = r.data || null;
+    renderExplorer();
+  }).catch(function () {
+    explorer.snapshot = null;
+    renderExplorer();
+  });
+}
+function requestFreshSnapshot() {
+  var p = pat();
+  var requestId = "lr-" + Date.now().toString(36) + "-" +
+    Math.random().toString(36).slice(2, 8);
+  var requestedAt = utcnow();
+  return ghPutJson(p, "list_request.json",
+    { request_id: requestId, requested_at: requestedAt, by: "admin" },
+    "AI File：要求重新整理快照").then(function () {
+      // 等 snapshot.json 的 generated_at 比要求時間新，最多等 30 秒
+      var start = Date.now();
+      return new Promise(function (resolve) {
+        function poll() {
+          ghGetJson(p, "snapshot.json").then(function (r) {
+            if (r.data && r.data.generated_at &&
+                r.data.generated_at >= requestedAt) return resolve(true);
+            if (Date.now() - start > EXPLORER_WAIT_MS) return resolve(false);
+            setTimeout(poll, 2000);
+          }).catch(function () {
+            if (Date.now() - start > EXPLORER_WAIT_MS) return resolve(false);
+            setTimeout(poll, 2000);
+          });
+        }
+        poll();
+      });
+    }).then(function (ok) {
+      if (!ok) notice("電腦沒回應，可能沒開。先顯示上次的快照。", "err");
+      return ok;
+    });
+}
+
+/* 渲染：麵包屑、列表、搜尋、狀態徽章 */
+function renderExplorer() {
+  var badge = $("explorer-status");
+  var count = $("explorer-count");
+  var crumbs = $("explorer-crumbs");
+  var tbody = $("explorer-list");
+  if (!explorer.snapshot) {
+    badge.textContent = "尚未載入";
+    count.textContent = "";
+    crumbs.innerHTML = "";
+    tbody.innerHTML = "<tr><td colspan='7' class='hint'>還沒有快照。請確認電腦上的 AI File 已經啟動過一次。</td></tr>";
+    return;
+  }
+  badge.textContent = explorerBadgeText();
+  if (explorer.snapshot.truncated) {
+    count.textContent = "（檔案太多，只顯示前 2000 筆）";
+  } else {
+    count.textContent = "共 " + explorer.snapshot.total_files + " 個檔案、" +
+      explorer.snapshot.total_dirs + " 個資料夾";
+  }
+  // 麵包屑
+  crumbs.innerHTML = "";
+  var root = document.createElement("a");
+  root.href = "#";
+  root.textContent = explorer.snapshot.folder_name || "全部檔案";
+  root.addEventListener("click", function (e) {
+    e.preventDefault();
+    explorer.currentPath = ""; explorer.search = "";
+    $("explorer-search").value = "";
+    renderExplorer();
+  });
+  crumbs.appendChild(root);
+  if (explorer.currentPath) {
+    var parts = explorer.currentPath.split("/");
+    var acc = "";
+    parts.forEach(function (seg) {
+      crumbs.appendChild(document.createTextNode(" / "));
+      acc = acc ? acc + "/" + seg : seg;
+      (function (p) {
+        var a = document.createElement("a");
+        a.href = "#"; a.textContent = seg;
+        a.addEventListener("click", function (e) {
+          e.preventDefault();
+          explorer.currentPath = p;
+          renderExplorer();
+        });
+        crumbs.appendChild(a);
+      })(acc);
+    });
+  }
+  // 列表
+  tbody.innerHTML = "";
+  var rows;
+  var searching = !!explorer.search.trim();
+  if (searching) {
+    rows = explorerSort(explorerSearch(explorer.snapshot, explorer.search.trim()));
+    if (!rows.length) {
+      tbody.innerHTML = "<tr><td colspan='7' class='hint'>沒有符合的檔案</td></tr>";
+      return;
+    }
+    count.textContent = "找到 " + rows.length + " 個符合的檔案";
+  } else {
+    rows = explorerSort(explorerChildren(explorer.snapshot, explorer.currentPath));
+    if (!rows.length) {
+      tbody.innerHTML = "<tr><td colspan='7' class='hint'>這個資料夾是空的</td></tr>";
+      return;
+    }
+  }
+  rows.forEach(function (e) { tbody.appendChild(explorerRow(e, searching)); });
+  updateSelectionBar();
+}
+function explorerRow(e, searching) {
+  var tr = document.createElement("tr");
+  tr.className = "explorer-row";
+  var tdCheck = document.createElement("td");
+  if (explorer.multiselect) {
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = !!explorer.selected[e.path];
+    cb.addEventListener("change", function () {
+      if (cb.checked) explorer.selected[e.path] = true;
+      else delete explorer.selected[e.path];
+      updateSelectionBar();
+    });
+    tdCheck.appendChild(cb);
+  }
+  tr.appendChild(tdCheck);
+  var name = e.path.split("/").pop();
+  var tdName = document.createElement("td");
+  tdName.className = "explorer-name";
+  tdName.textContent = (e.is_dir ? "📁 " : "📄 ") + name;
+  if (searching) {
+    tdName.appendChild(document.createElement("br"));
+    var meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = e.path;
+    tdName.appendChild(meta);
+  }
+  tdName.addEventListener("click", function () {
+    if (explorer.multiselect) {
+      toggleSelect(e.path);
+      renderExplorer();
+      return;
+    }
+    if (e.is_dir) {
+      explorer.currentPath = e.path;
+      explorer.search = "";
+      $("explorer-search").value = "";
+      renderExplorer();
+    }
+  });
+  tdName.addEventListener("dblclick", function () {
+    if (!explorer.multiselect) openExplorerAction(e);
+  });
+  tr.appendChild(tdName);
+  var tdExt = document.createElement("td");
+  tdExt.textContent = e.is_dir ? "—" : (e.ext || "—");
+  tr.appendChild(tdExt);
+  var tdCreated = document.createElement("td");
+  tdCreated.textContent = formatDateTime(e.created);
+  tr.appendChild(tdCreated);
+  var tdSize = document.createElement("td");
+  tdSize.textContent = e.is_dir ? "—" : formatSize(e.size || 0);
+  tr.appendChild(tdSize);
+  var tdKind = document.createElement("td");
+  tdKind.textContent = e.kind || "—";
+  tr.appendChild(tdKind);
+  var tdMore = document.createElement("td");
+  var btn = document.createElement("button");
+  btn.className = "btn btn-outline btn-small";
+  btn.textContent = "⋯";
+  btn.addEventListener("click", function () { openExplorerAction(e); });
+  tdMore.appendChild(btn);
+  tr.appendChild(tdMore);
+  return tr;
+}
+
+/* 多選 */
+function toggleSelect(path) {
+  if (explorer.selected[path]) delete explorer.selected[path];
+  else explorer.selected[path] = true;
+  updateSelectionBar();
+}
+function selectedPaths() { return Object.keys(explorer.selected); }
+function updateSelectionBar() {
+  var bar = $("explorer-selection");
+  var n = selectedPaths().length;
+  if (explorer.multiselect && n > 0) {
+    show(bar);
+    $("explorer-selection-count").textContent = "已選 " + n + " 個檔案";
+  } else {
+    hide(bar);
+  }
+}
+function setMultiselect(on) {
+  explorer.multiselect = on;
+  explorer.selected = {};
+  $("btn-explorer-multiselect").textContent = on ? "取消多選" : "多選";
+  renderExplorer();
+}
+function confirmMultiselect() {
+  var paths = selectedPaths();
+  if (!paths.length) return;
+  var entries = paths.map(function (p) {
+    return (explorer.snapshot.entries || []).find(function (e) { return e.path === p; });
+  }).filter(Boolean);
+  openExplorerModal("已選 " + entries.length + " 個項目", function (body) {
+    var p = document.createElement("p");
+    p.textContent = "要對這 " + entries.length + " 個項目做什麼？";
+    body.appendChild(p);
+    var ul = document.createElement("ul");
+    entries.forEach(function (e) {
+      var li = document.createElement("li");
+      li.textContent = e.path;
+      ul.appendChild(li);
+    });
+    body.appendChild(ul);
+  }, [
+    { text: "刪除", cls: "btn-danger", onClick: function () { closeExplorerModal(); confirmDeleteEntries(entries); } },
+    { text: "重新命名（變更）", cls: "btn-primary", onClick: function () { closeExplorerModal(); openRenameDialog(entries); } },
+    { text: "取消", onClick: closeExplorerModal }
+  ]);
+}
+
+/* 通用對話框 */
+function openExplorerModal(title, bodyBuilder, buttons) {
+  $("explorer-modal-title").textContent = title;
+  var body = $("explorer-modal-body");
+  body.innerHTML = "";
+  if (bodyBuilder) bodyBuilder(body);
+  var btns = $("explorer-modal-buttons");
+  btns.innerHTML = "";
+  (buttons || []).forEach(function (b) {
+    var btn = document.createElement("button");
+    btn.className = "btn " + (b.cls || "btn-outline");
+    btn.textContent = b.text;
+    btn.addEventListener("click", b.onClick);
+    btns.appendChild(btn);
+  });
+  show($("explorer-modal"));
+}
+function closeExplorerModal() { hide($("explorer-modal")); }
+
+/* 操作選單：檔案（下載／編輯／刪除／多選）、資料夾（重新命名／刪除） */
+function openExplorerAction(e) {
+  var name = e.path.split("/").pop();
+  if (e.is_dir) {
+    openExplorerModal("資料夾：" + name, function (body) {
+      var p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = "路徑：" + e.path;
+      body.appendChild(p);
+    }, [
+      { text: "重新命名", cls: "btn-primary", onClick: function () { closeExplorerModal(); openRenameDialog([e]); } },
+      { text: "刪除", cls: "btn-danger", onClick: function () { closeExplorerModal(); confirmDeleteEntries([e]); } },
+      { text: "取消", onClick: closeExplorerModal }
+    ]);
+  } else {
+    openExplorerModal("檔案：" + name, function (body) {
+      var p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = "路徑：" + e.path + " · " + formatSize(e.size || 0) + " · " + (e.kind || "");
+      body.appendChild(p);
+    }, [
+      { text: "下載", cls: "btn-primary", onClick: function () { closeExplorerModal(); downloadExplorerFile(e); } },
+      { text: "編輯", onClick: function () { closeExplorerModal(); editExplorerFile(e); } },
+      { text: "刪除", cls: "btn-danger", onClick: function () { closeExplorerModal(); confirmDeleteEntries([e]); } },
+      { text: "多選", onClick: function () { closeExplorerModal(); setMultiselect(true); toggleSelect(e.path); renderExplorer(); } },
+      { text: "取消", onClick: closeExplorerModal }
+    ]);
+  }
+}
+
+/* 管理員暫存（不走 AI 的工作階段檢查，但一樣要過停止旗標、
+ * 一樣進 manifest、一樣等電腦按「同意」才套用） */
+function checkAdminReady() {
+  var p = pat();
+  return ghGetJson(p, "stop.json").then(function (r) {
+    if (r.data && r.data.stopped) throw new Error("目前是停止狀態，無法暫存。請先按「恢復」。");
+    return true;
+  });
+}
+function stageAdminEntry(entry, fileB64) {
+  return queueStage(function () { return stageAdminEntryNow(entry, fileB64); });
+}
+function stageAdminEntryNow(entry, fileB64) {
+  var p = pat();
+  var putFile = entry.file
+    ? ghPutFile(p, "pending/" + entry.file, fileB64, "AI File：管理員暫存 " + entry.rel_path)
+    : Promise.resolve();
+  return putFile.then(function () {
+    return ghGetJson(p, "pending/manifest.json");
+  }).then(function (r) {
+    var manifest = (r.data && Array.isArray(r.data.files)) ? r.data : { files: [] };
+    manifest.files.push(entry);
+    return ghPutJson(p, "pending/manifest.json", manifest, "AI File：更新待同步清單");
+  }).then(function () {
+    return appendActivity(p, {
+      action: entry.action, ai_name: "管理員",
+      rel_path: entry.rel_path, detail: "管理員已暫存，等待電腦同意同步"
+    });
+  });
+}
+function makeAdminEntry(action, rel, extra) {
+  var entry = {
+    id: newStageId(),
+    rel_path: rel,
+    file: null,
+    action: action,
+    sha256: "",
+    size: 0,
+    ai_name: "管理員",
+    by: "admin",
+    time: utcnow(),
+    session_code: state.sessionCode || ""
+  };
+  if (extra) for (var k in extra) entry[k] = extra[k];
+  return entry;
+}
+function stageAdminFiles(fileList, dirPath) {
+  if (!fileList || !fileList.length) return;
+  checkAdminReady().then(function () {
+    var jobs = [];
+    Array.from(fileList).forEach(function (file) {
+      jobs.push(new Promise(function (resolve, reject) {
+        var rel;
+        try {
+          rel = sanitizeRelPath((dirPath ? dirPath + "/" : "") + file.name);
+        } catch (e) { return reject(e); }
+        var reader = new FileReader();
+        reader.onload = function () {
+          var bytes = new Uint8Array(reader.result);
+          sha256Hex(bytes).then(function (hash) {
+            var entry = makeAdminEntry("add", rel, {
+              file: pendingFileName(rel, Date.now() % 1000, hash),
+              sha256: hash, size: bytes.length
+            });
+            stageAdminEntry(entry, bytesToB64(bytes)).then(resolve).catch(reject);
+          }).catch(reject);
+        };
+        reader.onerror = function () { reject(new Error("讀取檔案失敗：" + file.name)); };
+        reader.readAsArrayBuffer(file);
+      }));
+    });
+    return Promise.all(jobs);
+  }).then(function () {
+    notice("已暫存 " + fileList.length + " 個檔案到「" + (dirPath || "根目錄") + "」。電腦開著會跳出確認，等你按「同意」才會寫入；電腦沒開就先等著。", "ok");
+    $("explorer-file-input").value = "";
+    refreshPending();
+  }).catch(function (e) { notice(String(e.message || e), "err"); });
+}
+
+/* 下載／編輯：向電腦索取檔案內容（content_request / content_response） */
+function requestFileContent(rel) {
+  var p = pat();
+  var requestId = "cr-" + Date.now().toString(36) + "-" +
+    Math.random().toString(36).slice(2, 8);
+  return ghPutJson(p, "content_request.json",
+    { request_id: requestId, path: rel, by: "admin", at: utcnow() },
+    "AI File：要求讀取檔案內容").then(function () {
+      var start = Date.now();
+      return new Promise(function (resolve) {
+        function poll() {
+          ghGetJson(p, "content_response.json").then(function (r) {
+            if (r.data && r.data.request_id === requestId) return resolve(r.data);
+            if (Date.now() - start > EXPLORER_WAIT_MS) return resolve(null);
+            setTimeout(poll, 2000);
+          }).catch(function () {
+            if (Date.now() - start > EXPLORER_WAIT_MS) return resolve(null);
+            setTimeout(poll, 2000);
+          });
+        }
+        poll();
+      });
+    });
+}
+function downloadExplorerFile(e) {
+  if ((e.size || 0) > CONTENT_MAX_BYTES) {
+    return notice("這個檔案超過 10 MB，無法透過網頁下載。", "err");
+  }
+  notice("正在向電腦索取檔案內容…", "info");
+  requestFileContent(e.path).then(function (res) {
+    if (!res) return notice("電腦沒開，無法讀取檔案內容。", "err");
+    if (!res.ok) return notice("讀取失敗：" + (res.error || "未知錯誤"), "err");
+    var bin = atob((res.content_b64 || "").replace(/\s/g, ""));
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    var blob = new Blob([bytes]);
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = e.path.split("/").pop();
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    notice("已開始下載：" + e.path.split("/").pop(), "ok");
+  }).catch(function (err) { notice(String(err.message || err), "err"); });
+}
+function editExplorerFile(e) {
+  if (TEXT_EDIT_EXTS.indexOf((e.ext || "").toLowerCase()) === -1) {
+    return notice("這個檔案不能在網頁上編輯，請下載後修改再上傳覆蓋。", "err");
+  }
+  if ((e.size || 0) > TEXT_EDIT_MAX_BYTES) {
+    return notice("這個檔案超過 200 KB，不能在網頁上編輯，請下載後修改再上傳覆蓋。", "err");
+  }
+  notice("正在向電腦索取檔案內容…", "info");
+  requestFileContent(e.path).then(function (res) {
+    if (!res) return notice("電腦沒開，無法讀取檔案內容。", "err");
+    if (!res.ok) return notice("讀取失敗：" + (res.error || "未知錯誤"), "err");
+    var text;
+    try { text = b64ToUtf8(res.content_b64 || ""); }
+    catch (err) { return notice("這個檔案不是 UTF-8 文字，無法在網頁上編輯。", "err"); }
+    openExplorerModal("編輯：" + e.path.split("/").pop(), function (body) {
+      var ta = document.createElement("textarea");
+      ta.id = "explorer-edit-text";
+      ta.rows = 14;
+      ta.value = text;
+      body.appendChild(ta);
+      var p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = "儲存後會暫存覆蓋同一路徑，電腦上按「同意」才會真的寫入。";
+      body.appendChild(p);
+    }, [
+      { text: "儲存", cls: "btn-primary", onClick: function () {
+          var newText = $("explorer-edit-text").value;
+          closeExplorerModal();
+          saveExplorerEdit(e.path, newText);
+        } },
+      { text: "取消", onClick: closeExplorerModal }
+    ]);
+  }).catch(function (err) { notice(String(err.message || err), "err"); });
+}
+function saveExplorerEdit(rel, text) {
+  checkAdminReady().then(function () {
+    var bytes = new TextEncoder().encode(text);
+    return sha256Hex(bytes).then(function (hash) {
+      var entry = makeAdminEntry("add", rel, {
+        file: pendingFileName(rel, Date.now() % 1000, hash),
+        sha256: hash, size: bytes.length
+      });
+      return stageAdminEntry(entry, bytesToB64(bytes));
+    });
+  }).then(function () {
+    notice("已暫存修改：" + rel + "。電腦上按「同意」後才會覆蓋。", "ok");
+    refreshPending();
+  }).catch(function (e) { notice(String(e.message || e), "err"); });
+}
+
+/* 刪除：資料夾要明確顯示裡面有幾個檔案 */
+function confirmDeleteEntries(entries) {
+  var lines = entries.map(function (e) {
+    if (e.is_dir) {
+      var n = explorer.snapshot ? countInside(explorer.snapshot, e.path) : 0;
+      return "資料夾「" + e.path + "」（裡面有 " + n + " 個檔案，整個刪掉）";
+    }
+    return "「" + e.path + "」";
+  });
+  if (!confirm("確定要刪除以下項目嗎？\n" + lines.join("\n") +
+      "\n\n這只是「暫存刪除要求」，電腦上按「同意」後才會真的刪除。")) return;
+  checkAdminReady().then(function () {
+    var jobs = entries.map(function (e) {
+      var entry = makeAdminEntry("delete", e.path, { is_dir: !!e.is_dir });
+      return stageAdminEntry(entry, null);
+    });
+    return Promise.all(jobs);
+  }).then(function () {
+    notice("已暫存 " + entries.length + " 筆刪除要求，電腦上按「同意」後才會真的刪除。", "ok");
+    refreshPending();
+    setMultiselect(false);
+  }).catch(function (e) { notice(String(e.message || e), "err"); });
+}
+
+/* 重新命名：每個選到的項目各一個輸入框，預填目前檔名 */
+function openRenameDialog(entries) {
+  var inputs = [];
+  openExplorerModal(entries.length === 1 ? "重新命名" : "重新命名（" + entries.length + " 個）", function (body) {
+    entries.forEach(function (e) {
+      var name = e.path.split("/").pop();
+      var parent = e.path.indexOf("/") === -1 ? "" : e.path.slice(0, e.path.lastIndexOf("/"));
+      var label = document.createElement("label");
+      label.textContent = e.path;
+      body.appendChild(label);
+      var input = document.createElement("input");
+      input.type = "text";
+      input.value = name;
+      input.setAttribute("data-parent", parent);
+      input.setAttribute("data-old", e.path);
+      body.appendChild(input);
+      inputs.push(input);
+    });
+    var p = document.createElement("p");
+    p.className = "hint";
+    p.textContent = "檔名不能有 / 或 \\，也不能是 ..。確定後會暫存重新命名要求，電腦上按「同意」才會真的改名。";
+    body.appendChild(p);
+  }, [
+    { text: "確定重新命名", cls: "btn-primary", onClick: function () {
+        var renames = [];
+        for (var i = 0; i < inputs.length; i++) {
+          var input = inputs[i];
+          var newName = input.value.trim();
+          if (!newName || newName.indexOf("/") !== -1 ||
+              newName.indexOf("\\") !== -1 || newName === ".." || newName === ".") {
+            notice("檔名不合法：" + (input.value || "（空白）"), "err");
+            return;
+          }
+          var parent = input.getAttribute("data-parent");
+          var oldPath = input.getAttribute("data-old");
+          var newRel = parent ? parent + "/" + newName : newName;
+          if (newRel === oldPath) continue;
+          renames.push({ oldPath: oldPath, newRel: newRel });
+        }
+        if (!renames.length) { closeExplorerModal(); return; }
+        closeExplorerModal();
+        stageRenames(renames);
+      } },
+    { text: "取消", onClick: closeExplorerModal }
+  ]);
+}
+function stageRenames(renames) {
+  checkAdminReady().then(function () {
+    var jobs = renames.map(function (r) {
+      var entry = makeAdminEntry("rename", r.oldPath, { new_rel: r.newRel });
+      return stageAdminEntry(entry, null);
+    });
+    return Promise.all(jobs);
+  }).then(function () {
+    notice("已暫存 " + renames.length + " 筆重新命名，電腦上按「同意」後才會真的改名。", "ok");
+    refreshPending();
+    setMultiselect(false);
+  }).catch(function (e) { notice(String(e.message || e), "err"); });
+}
+
 /* ---------- AI 登入 ---------- */
 function aiLogin() {
   var name = $("ai-name").value.trim();
@@ -680,8 +1315,19 @@ function pendingFileName(rel, index, sha) {
 function newStageId() {
   return "st-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
 }
+// 暫存寫入要排隊：manifest 和 activity.json 都是讀出來、改好、寫回去，
+// 一次上傳多個檔案時如果並行寫，後寫的會蓋掉先寫的（少一筆）。
+var stageQueue = Promise.resolve();
+function queueStage(fn) {
+  var run = function () { return fn(); };
+  stageQueue = stageQueue.then(run, run);
+  return stageQueue;
+}
 function stageEntry(entry, fileB64) {
   // entry: {id, rel_path, action, sha256, size, file(pending 名稱或 null)}
+  return queueStage(function () { return stageEntryNow(entry, fileB64); });
+}
+function stageEntryNow(entry, fileB64) {
   var p = pat();
   var putFile = entry.file
     ? ghPutFile(p, "pending/" + entry.file, fileB64, "AI File：" + state.ai.name + " 暫存 " + entry.rel_path)
@@ -831,13 +1477,15 @@ $("btn-help").addEventListener("click", openHelp);
 $("help-close").addEventListener("click", closeHelp);
 $("help-backdrop").addEventListener("click", closeHelp);
 document.addEventListener("keydown", function (e) {
-  if (e.key === "Escape") closeHelp();
+  if (e.key === "Escape") { closeHelp(); closeExplorerModal(); }
 });
 $("btn-logout").addEventListener("click", function () {
   state.adminAuthed = false; state.ai = null;
   try { localStorage.removeItem("aifile_ai"); } catch (e) {}
   if (state.sessionPoll) { clearInterval(state.sessionPoll); state.sessionPoll = null; }
   stopStatusTimer();
+  explorer.snapshot = null; explorer.currentPath = ""; explorer.search = "";
+  explorer.multiselect = false; explorer.selected = {}; explorer.online = false;
   showLanding();
   $("ai-name").value = "";
   $("ai-code").value = "";
@@ -859,6 +1507,20 @@ $("btn-stage-file").addEventListener("click", function () {
 });
 $("btn-stage-paste").addEventListener("click", stagePaste);
 $("btn-stage-delete").addEventListener("click", stageDelete);
+$("explorer-search").addEventListener("input", function () {
+  explorer.search = $("explorer-search").value;
+  renderExplorer();
+});
+$("btn-explorer-refresh").addEventListener("click", function () { refreshExplorer(true); });
+$("btn-explorer-upload").addEventListener("click", function () { $("explorer-file-input").click(); });
+$("explorer-file-input").addEventListener("change", function () {
+  stageAdminFiles($("explorer-file-input").files, explorer.currentPath);
+});
+$("btn-explorer-multiselect").addEventListener("click", function () { setMultiselect(!explorer.multiselect); });
+$("btn-explorer-confirm").addEventListener("click", confirmMultiselect);
+$("btn-explorer-cancel").addEventListener("click", function () { setMultiselect(false); });
+$("explorer-modal-close").addEventListener("click", closeExplorerModal);
+$("explorer-modal-backdrop").addEventListener("click", closeExplorerModal);
 
 /* ---------- 啟動 ---------- */
 // 只把名稱和代碼預填進欄位，絕對不自動還原已允許的工作階段：

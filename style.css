@@ -184,6 +184,45 @@ textarea { resize: vertical; }
 .batch-head { font-weight: 700; }
 .batch-undone { color: var(--muted); }
 
+/* 檔案總管 */
+.explorer-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; align-items: center; }
+.explorer-toolbar input[type="text"] { flex: 1; min-width: 180px; }
+.badge {
+  display: inline-block;
+  background: #dbeafe;
+  color: #1e40af;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 13px;
+  font-weight: 700;
+}
+.explorer-crumbs { font-size: 14px; margin: 6px 0; word-break: break-all; }
+.explorer-crumbs a { color: var(--accent); }
+.explorer-wrap { overflow-x: auto; }
+.explorer-table { width: 100%; min-width: 640px; border-collapse: collapse; font-size: 14px; }
+.explorer-table th, .explorer-table td {
+  text-align: left;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.explorer-table th { color: var(--muted); font-size: 13px; }
+.explorer-table .col-check { width: 34px; }
+.explorer-name { cursor: pointer; word-break: break-all; white-space: normal; }
+.explorer-name:hover { color: var(--accent); }
+.explorer-table .meta { color: var(--muted); font-size: 12px; }
+.explorer-selection {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0;
+  padding: 10px 12px;
+  background: #dbeafe;
+  border-radius: 8px;
+}
+#explorer-modal-body textarea { min-height: 260px; font-family: monospace; }
+
 @media (max-width: 600px) {
   .kv div { flex-direction: column; gap: 0; }
   .kv dt { width: auto; }

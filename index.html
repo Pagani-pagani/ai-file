@@ -89,6 +89,29 @@
     <h3>待同步清單</h3>
     <ul id="pending-list" class="list"><li class="hint">目前沒有待同步的檔案。</li></ul>
 
+    <h3>檔案總管</h3>
+    <p class="hint">電腦開著時顯示即時內容，沒開就顯示上次的快照。這裡的上傳、編輯、刪除、重新命名都會先暫存，電腦上按「同意」才會真的套用。</p>
+    <div class="explorer-toolbar">
+      <input type="text" id="explorer-search" placeholder="搜尋檔案…" autocomplete="off">
+      <button id="btn-explorer-refresh" class="btn btn-outline">重新整理</button>
+      <button id="btn-explorer-upload" class="btn btn-primary">上傳新檔案</button>
+      <input type="file" id="explorer-file-input" multiple class="hidden">
+      <button id="btn-explorer-multiselect" class="btn btn-outline">多選</button>
+    </div>
+    <p class="hint"><span id="explorer-status" class="badge">尚未載入</span> <span id="explorer-count"></span></p>
+    <p class="explorer-crumbs" id="explorer-crumbs"></p>
+    <div class="explorer-wrap">
+      <table class="explorer-table">
+        <thead><tr><th class="col-check"></th><th>名稱</th><th>副檔名</th><th>建立時間</th><th>大小</th><th>種類</th><th></th></tr></thead>
+        <tbody id="explorer-list"></tbody>
+      </table>
+    </div>
+    <div id="explorer-selection" class="explorer-selection hidden">
+      <span id="explorer-selection-count">已選 0 個檔案</span>
+      <button id="btn-explorer-confirm" class="btn btn-primary">確認</button>
+      <button id="btn-explorer-cancel" class="btn btn-outline">取消</button>
+    </div>
+
     <h3>過去所有異動紀錄</h3>
     <p class="hint">同一批同步會整理成一組，旁邊的「返回」可以回到同步前的狀態（要等本地端確認）。</p>
     <ul id="activity-list" class="list"><li class="hint">還沒有紀錄。</li></ul>
@@ -190,6 +213,7 @@
       <li>AI 暫存的檔案會等在中繼 repo。你的電腦一看到待同步，就會跳「立即同步」讓你看過清單，按「同意」才會真的寫進電腦。</li>
       <li>隨時可以按本地端浮動視窗的「停止」，或在這裡的管理員介面按「停止」。停止後 AI 就動不到任何檔案。</li>
       <li>每次同步之前，本地端會先備份受影響的檔案（放在程式資料夾的 ai-file-backup，只留最近 20 批）。想回到同步前的狀態，按浮動視窗的「紀錄」→ 該批的「返回」，或在管理員介面的異動紀錄按「返回」（要等本地端確認）。</li>
+      <li>管理員介面裡有「檔案總管」：可以看到允許的資料夾裡所有檔案與資料夾（副檔名、建立時間、大小、種類），電腦開著會顯示即時內容，沒開就顯示上次快照。上傳、編輯、刪除、重新命名都會先暫存，電腦上按「同意」才會真的套用。</li>
     </ol>
     <h3>安全說明</h3>
     <ul>
@@ -203,8 +227,21 @@
   </div>
 </div>
 
+<!-- 檔案總管通用對話框 -->
+<div id="explorer-modal" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="modal-backdrop" id="explorer-modal-backdrop"></div>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2 id="explorer-modal-title">操作</h2>
+      <button id="explorer-modal-close" class="btn btn-outline">關閉</button>
+    </div>
+    <div id="explorer-modal-body"></div>
+    <div class="row" id="explorer-modal-buttons"></div>
+  </div>
+</div>
+
 <footer class="footer">
-  <p>AI File v1.3 — 檔案先暫存、你看過才同步、隨時能停止。</p>
+  <p>AI File v1.4 — 檔案先暫存、你看過才同步、隨時能停止。</p>
   <button id="btn-logout" class="btn btn-outline hidden">登出</button>
 </footer>
 <script src="app.js"></script>

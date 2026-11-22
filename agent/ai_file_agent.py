@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI File 本地端程式 v1.3
+AI File 本地端程式 v1.4
 ===================
 讓 Muse 把檔案直接送到你的 Windows 電腦。
 架構：網頁版只能把檔案暫存到私人中繼 repo（ai-file-relay），
@@ -33,7 +33,7 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 
-VERSION_DEFAULT = "1.3"
+VERSION_DEFAULT = "1.4"
 RELAY_OWNER = "Pagani-pagani"
 RELAY_REPO = "ai-file-relay"
 GITHUB_API = "https://api.github.com"
@@ -49,6 +49,96 @@ HISTORY_FILE = os.path.join(BASE_DIR, "ai-file-history.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "ai-file-backup")
 HISTORY_KEEP = 20  # 備份紀錄只留最近幾批
 UPDATE_BAT = os.path.join(BASE_DIR, "更新 AI File.bat")
+
+SNAPSHOT_MAX_ENTRIES = 2000  # 快照最多列幾筆，超過就 truncated
+CONTENT_MAX_BYTES = 10 * 1024 * 1024  # 網頁索取檔案內容的上限（10 MB）
+
+# 快照裡的檔案種類（副檔名 → 中文名；不在表裡的是「其他」）
+KIND_BY_EXT = {}
+for _exts, _kind in (
+    (("png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "avif"), "圖片"),
+    (("txt", "md", "doc", "docx", "pdf", "csv"), "文件"),
+    (("xls", "xlsx"), "試算表"),
+    (("ppt", "pptx"), "簡報"),
+    (("mp4", "mov", "avi", "mkv"), "影片"),
+    (("mp3", "wav", "flac"), "音樂"),
+    (("zip", "rar", "7z"), "壓縮檔"),
+    (("py", "js", "html", "css", "json", "bat", "ps1", "exe"), "程式"),
+):
+    for _e in _exts:
+        KIND_BY_EXT[_e] = _kind
+
+
+def file_kind(ext, is_dir):
+    """副檔名（小寫、不含點）→ 中文種類；資料夾固定是「資料夾」。"""
+    if is_dir:
+        return "資料夾"
+    return KIND_BY_EXT.get((ext or "").lower(), "其他")
+
+
+def build_snapshot(allowed_folder, max_entries=SNAPSHOT_MAX_ENTRIES):
+    """遞迴列出允許的資料夾裡所有子資料夾與檔案（只列清單，不讀內容、
+    不算雜湊）。回傳 snapshot.json 的內容。
+
+    欄位：generated_at、folder_name、total_files、total_dirs、
+    truncated、entries（每筆：path、is_dir、size、created、ext、kind）。
+    超過上限時只列前 max_entries 筆，truncated=true。
+    讀不到的資料夾／檔案就跳過，不讓快照整個失敗。
+    """
+    entries = []
+    total_files = 0
+    total_dirs = 0
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(allowed_folder):
+        dirnames.sort()
+        filenames.sort()
+        for name in dirnames:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, allowed_folder).replace(os.sep, "/")
+            total_dirs += 1
+            if len(entries) < max_entries:
+                entries.append(_snapshot_entry(rel, True, full))
+            else:
+                truncated = True
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, allowed_folder).replace(os.sep, "/")
+            total_files += 1
+            if len(entries) < max_entries:
+                entries.append(_snapshot_entry(rel, False, full))
+            else:
+                truncated = True
+    return {
+        "generated_at": utcnow_iso(),
+        "folder_name": os.path.basename(
+            os.path.normpath(allowed_folder)),
+        "total_files": total_files,
+        "total_dirs": total_dirs,
+        "truncated": truncated,
+        "entries": entries,
+    }
+
+
+def _snapshot_entry(rel, is_dir, full):
+    try:
+        created = datetime.fromtimestamp(
+            os.path.getctime(full), timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        created = None
+    try:
+        size = 0 if is_dir else os.path.getsize(full)
+    except OSError:
+        size = 0
+    ext = "" if is_dir else os.path.splitext(full)[1][1:].lower()
+    return {
+        "path": rel,
+        "is_dir": is_dir,
+        "size": size,
+        "created": created,
+        "ext": ext,
+        "kind": file_kind(ext, is_dir),
+    }
 
 # 連線失敗的原因對照表（自我檢查、設定精靈、浮動視窗共用）
 CONNECTION_CAUSES = (
@@ -655,7 +745,8 @@ class TkUI:
         lb.pack(fill="both", expand=True)
         for c in changes:
             action = {"add": "新增", "modify": "修改",
-                      "delete": "刪除"}.get(c.get("action", "add"), "新增")
+                      "delete": "刪除", "rename": "重新命名"}.get(
+                          c.get("action", "add"), "新增")
             lb.insert("end", "[%s] %s（%s，%s）" % (
                 action, c.get("rel_path", "?"),
                 c.get("ai_name", "?"), c.get("time", "")[:19]))
@@ -779,10 +870,12 @@ class TkUI:
                           anchor="w", padx=10, pady=(6, 2))
             for item in batch.get("items", []):
                 verb = {"add": "新增", "modify": "修改",
-                        "delete": "刪除"}.get(
+                        "delete": "刪除", "rename": "重新命名"}.get(
                             item.get("action", "add"), "新增")
-                ttk.Label(row, text="  [%s] %s" % (
-                    verb, item.get("rel_path", "")),
+                label = "  [%s] %s" % (verb, item.get("rel_path", ""))
+                if item.get("action") == "rename" and item.get("new_rel"):
+                    label += " → %s" % item["new_rel"]
+                ttk.Label(row, text=label,
                     font=("Microsoft JhengHei", 10)).pack(
                         anchor="w", padx=10)
             if batch.get("undone"):
@@ -820,6 +913,7 @@ class TkUI:
             return
         try:
             action = {"add": "新增", "modify": "修改", "delete": "刪除",
+                      "rename": "重新命名",
                       "session-approved": "已允許連線",
                       "session-rejected": "已拒絕連線",
                       "rejected-path": "已拒絕越界",
@@ -920,6 +1014,8 @@ class Agent:
         self._last_manifest_sig = None
         self._seen_waiting = set()
         self._seen_undo = set()
+        self._seen_list_requests = set()
+        self._seen_content_requests = set()
         self._last_heartbeat = 0
         self._pending_notice_sig = None
         self._last_poll_ok_at = 0
@@ -1037,6 +1133,32 @@ class Agent:
                 fail_count += 1
                 continue
             try:
+                if item.get("action") == "rename":
+                    # 重新命名：把檔案從 new_rel 改回 rel。
+                    # new_rel 不存在或 rel 已被佔用就跳過，絕對不誤刪。
+                    new_rel = item.get("new_rel", "")
+                    try:
+                        new_target = safe_join(self.allowed_folder,
+                                               new_rel)
+                    except ValueError:
+                        fail_count += 1
+                        log_local("返回失敗：重新命名目標路徑不合法 %s"
+                                  % new_rel)
+                        continue
+                    if not os.path.exists(new_target):
+                        fail_count += 1
+                        log_local("返回失敗：%s 已經不在了，無法改回 %s"
+                                  % (new_rel, rel))
+                    elif os.path.exists(target):
+                        fail_count += 1
+                        log_local("返回失敗：%s 已被佔用，不覆蓋" % rel)
+                    else:
+                        parent = os.path.dirname(target)
+                        if parent:
+                            os.makedirs(parent, exist_ok=True)
+                        os.rename(new_target, target)
+                        ok_count += 1
+                    continue
                 if item.get("existed"):
                     src = os.path.join(
                         batch_dir, *item["backup"].split("/"))
@@ -1044,10 +1166,21 @@ class Agent:
                         fail_count += 1
                         log_local("返回失敗：備份遺失 %s" % rel)
                         continue
-                    parent = os.path.dirname(target)
-                    if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    shutil.copyfile(src, target)
+                    if item.get("is_dir"):
+                        # 被刪掉的整棵資料夾：目標已存在就不覆蓋
+                        if os.path.exists(target):
+                            fail_count += 1
+                            log_local("返回失敗：%s 已存在，不覆蓋" % rel)
+                            continue
+                        parent = os.path.dirname(target)
+                        if parent:
+                            os.makedirs(parent, exist_ok=True)
+                        shutil.copytree(src, target)
+                    else:
+                        parent = os.path.dirname(target)
+                        if parent:
+                            os.makedirs(parent, exist_ok=True)
+                        shutil.copyfile(src, target)
                 else:
                     if os.path.exists(target) \
                             and os.path.isfile(target):
@@ -1075,6 +1208,8 @@ class Agent:
                        % (ok_count, fail_count))
         log_local("已返回批次 %s：%d 還原，%d 失敗"
                   % (batch_id, ok_count, fail_count))
+        # 返回完更新一次快照，檔案總管才看得到還原後的樣子
+        self.publish_snapshot()
         return fail_count == 0
 
     def _check_undo(self):
@@ -1106,6 +1241,94 @@ class Agent:
             log_local("使用者拒絕返回批次 %s" % batch_id)
         try:
             self.relay.delete("undo.json", "AI File：已處理返回要求")
+        except Exception:
+            pass
+
+    # -- 快照（檔案總管用） ----------------------------------------
+    def publish_snapshot(self):
+        """對允許的資料夾做一次快照，寫到中繼的 snapshot.json。
+        快照是顯示用的，不依賴工作階段狀態；失敗只寫 log，不擋主流程。"""
+        try:
+            snap = build_snapshot(self.allowed_folder)
+            self.relay.put_json("snapshot.json", snap, "AI File：更新快照")
+            log_local("已更新快照：%d 個檔案、%d 個資料夾%s" % (
+                snap["total_files"], snap["total_dirs"],
+                "（已截斷，只列前 2000 筆）" if snap["truncated"] else ""))
+            return True
+        except Exception as e:
+            log_local("更新快照失敗：%s" % e)
+            return False
+
+    def _check_list_request(self):
+        """輪詢 list_request.json：網頁版要求重新整理檔案總管時，
+        重新產生快照、寫 snapshot.json、刪掉 request 檔。"""
+        try:
+            req, _ = self.relay.get_json("list_request.json")
+        except Exception:
+            return
+        if not isinstance(req, dict) or not req.get("request_id"):
+            return
+        request_id = req["request_id"]
+        if request_id in self._seen_list_requests:
+            return
+        self._seen_list_requests.add(request_id)
+        log_local("收到檔案總管重新整理要求：%s" % request_id)
+        self.publish_snapshot()
+        try:
+            self.relay.delete("list_request.json",
+                              "AI File：已處理檔案總管重新整理要求")
+        except Exception:
+            pass
+
+    def _check_content_request(self):
+        """輪詢 content_request.json：網頁版要讀一個檔案的內容
+        （編輯／下載用）。讀到就把 base64 寫進 content_response.json，
+        再刪掉 request 檔。超過 10 MB 或讀不到就回 error。
+        路徑一定通過守門；這是管理員（使用者本人）的要求，不依賴
+        工作階段狀態，但停止旗標開啟時也不讀（停了就是停了）。"""
+        if self.stopped:
+            return
+        try:
+            req, _ = self.relay.get_json("content_request.json")
+        except Exception:
+            return
+        if not isinstance(req, dict) or not req.get("request_id") \
+                or not req.get("path"):
+            return
+        request_id = req["request_id"]
+        if request_id in self._seen_content_requests:
+            return
+        self._seen_content_requests.add(request_id)
+        rel = req["path"]
+        response = {"request_id": request_id, "path": rel, "ok": False}
+        try:
+            target = safe_join(self.allowed_folder, rel)
+            if os.path.isdir(target):
+                response["error"] = "這是資料夾，無法讀取內容"
+            elif not os.path.exists(target):
+                response["error"] = "找不到檔案"
+            elif os.path.getsize(target) > CONTENT_MAX_BYTES:
+                response["error"] = "檔案太大（超過 10 MB）"
+            else:
+                with open(target, "rb") as f:
+                    data = f.read()
+                response["ok"] = True
+                response["content_b64"] = base64.b64encode(
+                    data).decode("ascii")
+                response["size"] = len(data)
+        except ValueError as e:
+            response["error"] = "路徑不合法：%s" % e
+            log_local("拒絕讀取檔案內容（越界）：%s" % rel)
+        except OSError as e:
+            response["error"] = "讀取失敗：%s" % e
+        try:
+            self.relay.put_json("content_response.json", response,
+                                "AI File：回傳檔案內容")
+        except Exception as e:
+            log_local("寫入 content_response.json 失敗：%s" % e)
+        try:
+            self.relay.delete("content_request.json",
+                              "AI File：已處理檔案內容要求")
         except Exception:
             pass
 
@@ -1159,6 +1382,7 @@ class Agent:
             self.ui.set_status("監控中 — %s" % os.path.basename(
                 os.path.normpath(self.allowed_folder)))
             self.send_heartbeat(force=True)
+            self.publish_snapshot()
             log_local("重設完成，已用新設定繼續監控")
             return True
         # 使用者關掉精靈沒存：沒有設定了，停在停止狀態
@@ -1293,20 +1517,24 @@ class Agent:
         sig = sha256_text(json.dumps(files, ensure_ascii=False, sort_keys=True))
         if sig == self._last_manifest_sig:
             return  # 已經處理過同一份清單
-        # 工作階段必須是已允許，才會跳出同步確認
-        try:
-            session, _ = self.relay.get_json("session.json")
-        except Exception:
-            session = None
-        if not (isinstance(session, dict)
-                and session.get("status") == "approved"):
-            if sig != self._pending_notice_sig:
-                self._pending_notice_sig = sig
-                self.ui.notify("AI File：有待同步檔案",
-                               "中繼有 %d 個檔案等著同步，"
-                               "但工作階段尚未允許。\n請先在電腦上按「是」允許連線。"
-                               % len(files))
-            return
+        # 工作階段必須是已允許，才會跳出同步確認；但管理員（使用者本人）
+        # 在檔案總管暫存的項目（by="admin"）不用等工作階段——使用者在
+        # 同步確認窗按「同意」本身就是授權。AI 的項目仍要先按「是」。
+        admin_only = all(f.get("by") == "admin" for f in files)
+        if not admin_only:
+            try:
+                session, _ = self.relay.get_json("session.json")
+            except Exception:
+                session = None
+            if not (isinstance(session, dict)
+                    and session.get("status") == "approved"):
+                if sig != self._pending_notice_sig:
+                    self._pending_notice_sig = sig
+                    self.ui.notify("AI File：有待同步檔案",
+                                   "中繼有 %d 個檔案等著同步，"
+                                   "但工作階段尚未允許。\n請先在電腦上按「是」允許連線。"
+                                   % len(files))
+                return
         # 跳「立即同步」確認窗，使用者看過清單、按同意才寫入
         if not self.ui.ask_sync(files):
             self._last_manifest_sig = sig  # 稍後再說：等清單變了再問
@@ -1331,35 +1559,50 @@ class Agent:
         results = []
         remaining = []
         # 0. 先備份：還沒寫入任何東西之前，備份所有受影響檔案的目前內容
+        # backups[idx] = (existed, backup_rel, error, is_dir)
         backups = {}
         for idx, entry in enumerate(files):
             rel = entry.get("rel_path", "")
+            action = entry.get("action", "add")
             try:
                 target = safe_join(self.allowed_folder, rel)
             except ValueError:
-                backups[idx] = (False, None, "path")
+                backups[idx] = (False, None, "path", False)
                 continue
-            if os.path.isfile(target):
+            if os.path.isdir(target) and action in ("delete", "rename"):
+                # 刪除／重新命名資料夾：整棵樹先備份起來，才能事後返回
+                try:
+                    clean = sanitize_rel_path(rel)
+                    dest = os.path.join(batch_dir, *clean.split("/"))
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copytree(target, dest)
+                    backups[idx] = (True, clean, None, True)
+                except OSError as e:
+                    backups[idx] = (False, None, "備份失敗：%s" % e, True)
+            elif os.path.isfile(target):
                 try:
                     clean = sanitize_rel_path(rel)
                     dest = os.path.join(batch_dir, *clean.split("/"))
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
                     shutil.copyfile(target, dest)
-                    backups[idx] = (True, clean, None)
+                    backups[idx] = (True, clean, None, False)
                 except OSError as e:
-                    backups[idx] = (False, None, "備份失敗：%s" % e)
+                    backups[idx] = (False, None, "備份失敗：%s" % e, False)
             elif os.path.exists(target):
-                backups[idx] = (False, None, "是資料夾，無法處理")
+                backups[idx] = (False, None, "是資料夾，無法處理", False)
             else:
-                backups[idx] = (False, None, None)
+                backups[idx] = (False, None, None, False)
         for idx, entry in enumerate(files):
             rel = entry.get("rel_path", "")
             action = entry.get("action", "add")
             ai_name = entry.get("ai_name", "")
             result = {"rel_path": rel, "action": action,
                       "ai_name": ai_name, "ok": False}
-            # 1. 工作階段代碼必須是當下有效的
-            if entry.get("session_code") != self.session_code:
+            # 1. 工作階段代碼必須是當下有效的；但管理員（使用者本人）
+            # 在檔案總管暫存的項目（by="admin"）不用檢查——那是他用
+            # 自己的金鑰寫的，真正的授權是他稍後在同步確認窗按「同意」。
+            if entry.get("by") != "admin" \
+                    and entry.get("session_code") != self.session_code:
                 result["error"] = "工作階段代碼不符，已拒收"
                 self._record_reject(entry, "工作階段代碼不符", batch_id)
                 results.append(result)
@@ -1374,16 +1617,18 @@ class Agent:
                 results.append(result)
                 continue  # 越界的直接丟掉，不留在待同步
             # 2b. 備份失敗的檔案不寫入，留在待同步等下次
-            backup_error = backups.get(idx, (False, None, None))[2]
+            backup_error = backups.get(idx, (False, None, None, False))[2]
             if backup_error and backup_error != "path":
                 result["error"] = backup_error
                 remaining.append(entry)
                 results.append(result)
                 continue
-            # 3. 刪除
+            # 3. 刪除（檔案或整棵資料夾）
             if action == "delete":
                 try:
-                    if os.path.exists(target):
+                    if os.path.isdir(target):
+                        shutil.rmtree(target)
+                    elif os.path.exists(target):
                         os.remove(target)
                     result["ok"] = True
                 except OSError as e:
@@ -1395,7 +1640,44 @@ class Agent:
                     history_items.append({
                         "rel_path": rel, "action": action,
                         "existed": backups[idx][0],
-                        "backup": backups[idx][1]})
+                        "backup": backups[idx][1],
+                        "is_dir": backups[idx][3]})
+                continue
+            # 3b. 重新命名（沒有暫存檔，直接改名）
+            if action == "rename":
+                new_rel = entry.get("new_rel", "")
+                try:
+                    new_target = safe_join(self.allowed_folder, new_rel)
+                except ValueError as e:
+                    result["error"] = "新路徑不合法：%s" % e
+                    remaining.append(entry)
+                    results.append(result)
+                    continue
+                try:
+                    if not os.path.exists(target):
+                        result["error"] = "要改名的檔案不存在"
+                        remaining.append(entry)
+                    elif os.path.exists(new_target):
+                        result["error"] = "目標名稱已經存在，不覆蓋"
+                        remaining.append(entry)
+                    else:
+                        parent = os.path.dirname(new_target)
+                        if parent:
+                            os.makedirs(parent, exist_ok=True)
+                        os.rename(target, new_target)
+                        result["ok"] = True
+                except OSError as e:
+                    result["error"] = "重新命名失敗：%s" % e
+                    remaining.append(entry)
+                self._record_applied(entry, result, batch_id)
+                results.append(result)
+                if result["ok"]:
+                    history_items.append({
+                        "rel_path": rel, "action": action,
+                        "new_rel": sanitize_rel_path(new_rel),
+                        "existed": backups[idx][0],
+                        "backup": backups[idx][1],
+                        "is_dir": backups[idx][3]})
                 continue
             # 4. 下載並驗證雜湊
             pending_name = entry.get("file", "")
@@ -1438,7 +1720,8 @@ class Agent:
                 history_items.append({
                     "rel_path": rel, "action": action,
                     "existed": backups[idx][0],
-                    "backup": backups[idx][1]})
+                    "backup": backups[idx][1],
+                    "is_dir": backups[idx][3]})
             # 6. 成功就從中繼刪掉暫存檔
             if result["ok"]:
                 try:
@@ -1467,11 +1750,14 @@ class Agent:
                                 "AI File：更新待同步清單")
         except Exception as e:
             log_local("更新待同步清單失敗：%s" % e)
+        # 同步完更新一次快照，檔案總管才看得到最新的樣子
+        self.publish_snapshot()
         return results
 
     def _record_applied(self, entry, result, batch_id=None):
         verb = {"add": "新增", "modify": "修改",
-                "delete": "刪除"}.get(entry.get("action", "add"), "新增")
+                "delete": "刪除", "rename": "重新命名"}.get(
+                    entry.get("action", "add"), "新增")
         if result.get("ok"):
             act = {
                 "action": entry.get("action", "add"),
@@ -1536,6 +1822,9 @@ class Agent:
                                "Muse 現在動不到你的檔案。" % stop.get("by", ""))
                 log_local("偵測到停止旗標（by=%s），停手" % stop.get("by", ""))
             self.send_heartbeat()
+            # 停止只擋寫入與讀取檔案內容：快照重新整理是唯讀的清單，
+            # 使用者本人在看自己的檔案，照常回答；但下載／編輯要先恢復。
+            self._check_list_request()
             self._refresh_conn_status()
             return
         if self.stopped and not (isinstance(stop, dict)
@@ -1548,6 +1837,8 @@ class Agent:
         self._check_session()
         self._check_regen()
         self._check_undo()
+        self._check_list_request()
+        self._check_content_request()
         self._check_pending()
         self._refresh_conn_status()
         if not self.stopped:
@@ -1762,6 +2053,8 @@ def main(argv):
         return 0
 
     agent.send_heartbeat(force=True)
+    # 啟動完成就做一次快照，網頁版一打開就有最新的清單
+    agent.publish_snapshot()
 
     if "--once" in argv:
         try:
@@ -1825,7 +2118,39 @@ def run_core_check():
         checks.append(("備份批次 id 格式",
                        len(bid) == 20 and bid[8] == "-"
                        and bid[15] == "-"))
-        checks.append(("VERSION 是 1.3", VERSION == "1.3"))
+        checks.append(("檔案種類：圖片", file_kind("jpg", False) == "圖片"))
+        checks.append(("檔案種類：試算表",
+                       file_kind("XLSX", False) == "試算表"))
+        checks.append(("檔案種類：其他",
+                       file_kind("xyz", False) == "其他"))
+        checks.append(("檔案種類：資料夾",
+                       file_kind("", True) == "資料夾"))
+        _snap_dir = tempfile.mkdtemp(prefix="aifile_check_snap_")
+        os.makedirs(os.path.join(_snap_dir, "子資料夾"), exist_ok=True)
+        with open(os.path.join(_snap_dir, "a.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write("hello")
+        with open(os.path.join(_snap_dir, "子資料夾", "b.png"), "wb") as f:
+            f.write(b"\x89PNG")
+        _snap = build_snapshot(_snap_dir)
+        checks.append(("快照：檔案與資料夾數正確",
+                       _snap["total_files"] == 2
+                       and _snap["total_dirs"] == 1
+                       and len(_snap["entries"]) == 3))
+        checks.append(("快照：種類與副檔名正確",
+                       any(e["path"] == "a.txt" and e["kind"] == "文件"
+                           and e["ext"] == "txt" and e["size"] == 5
+                           for e in _snap["entries"])
+                       and any(e["path"] == "子資料夾/b.png"
+                               and e["kind"] == "圖片"
+                               for e in _snap["entries"])
+                       and any(e["path"] == "子資料夾"
+                               and e["is_dir"] and e["kind"] == "資料夾"
+                               for e in _snap["entries"])))
+        checks.append(("快照：上限截斷",
+                       build_snapshot(_snap_dir, max_entries=2)
+                       ["truncated"] is True))
+        checks.append(("VERSION 是 1.4", VERSION == "1.4"))
     except Exception as e:
         print("檢查出錯：%s" % e)
         return 1

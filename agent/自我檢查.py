@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""AI File 自我檢查 v1.3
+"""AI File 自我檢查 v1.4
 檢查設定檔、路徑守門、雜湊驗證、停止旗標、manifest 解析、版本比對、連線、
-備份與返回。
+備份與返回、快照、重新命名、資料夾刪除。
 用法：python 自我檢查.py
 全部 [OK] 才算通過。第 10 步連線是正式檢查：失敗會印完整錯誤＋原因對照，
 沒有 PAT 也會明確講要先完成設定精靈，不是一句警告就帶過。
@@ -202,13 +202,13 @@ def main():
               "（需要先去 GitHub 產生細粒度 Token）")
 
     # 11. 版本比對
-    check("版本比對：1.3 > 1.2",
-          A.parse_version("1.3") > A.parse_version("1.2"))
+    check("版本比對：1.4 > 1.3",
+          A.parse_version("1.4") > A.parse_version("1.3"))
     check("版本比對：1.10 > 1.2",
           A.parse_version("1.10") > A.parse_version("1.2"))
-    check("版本比對：1.3 == 1.3",
-          A.parse_version("1.3") == A.parse_version("1.3"))
-    check("VERSION 是 1.3", A.VERSION == "1.3")
+    check("版本比對：1.4 == 1.4",
+          A.parse_version("1.4") == A.parse_version("1.4"))
+    check("VERSION 是 1.4", A.VERSION == "1.4")
 
     # 12. 備份與返回（本機假中繼＋自動同意的假 UI）
     btmp = tempfile.mkdtemp(prefix="aifile_check_undo_")
@@ -272,6 +272,160 @@ def main():
           not bagent.undo_batch(bid))
     check("備份與返回：啟動重設已允許的工作階段",
           _reset_check(brelay, bcode))
+
+    # 13. 快照、重新命名、資料夾刪除（本機假中繼＋自動同意的假 UI）
+    ctmp = tempfile.mkdtemp(prefix="aifile_check_snap2_")
+    crelay = A.LocalRelay(ctmp)
+    callowed = os.path.join(ctmp, "allowed")
+    os.makedirs(os.path.join(callowed, "資料夾A", "子"), exist_ok=True)
+    os.makedirs(os.path.join(callowed, "刪我"), exist_ok=True)
+    with open(os.path.join(callowed, "頂層.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("頂層內容")
+    with open(os.path.join(callowed, "圖.png"), "wb") as f:
+        f.write(b"\x89PNG1234")
+    with open(os.path.join(callowed, "資料夾A", "內檔.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("內檔")
+    with open(os.path.join(callowed, "資料夾A", "子", "深.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("深層")
+    with open(os.path.join(callowed, "刪我", "一.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("一")
+    with open(os.path.join(callowed, "刪我", "二.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("二")
+    ccode = A.new_session_code()
+    cagent = A.Agent({"pat": "fake", "allowed_folder": callowed,
+                      "session_code": ccode},
+                     crelay, A.HeadlessUI(approve=True))
+    crelay.put_json("stop.json", {"stopped": False}, "test")
+    crelay.put_json("session.json", {
+        "status": "approved", "ai_name": "Muse",
+        "code_hash": A.code_hash(ccode)}, "test")
+    snap = A.build_snapshot(callowed)
+    check("快照：檔案與資料夾數正確",
+          snap["total_files"] == 6 and snap["total_dirs"] == 3
+          and len(snap["entries"]) == 9)
+    check("快照：種類、副檔名、大小、時間欄位正確",
+          any(e["path"] == "圖.png" and e["kind"] == "圖片"
+              and e["ext"] == "png" and e["size"] == 8
+              and e["created"] for e in snap["entries"])
+          and any(e["path"] == "頂層.txt" and e["kind"] == "文件"
+                  and e["size"] == len("頂層內容".encode("utf-8"))
+                  for e in snap["entries"])
+          and any(e["path"] == "資料夾A" and e["is_dir"]
+                  and e["kind"] == "資料夾" and e["size"] == 0
+                  for e in snap["entries"])
+          and any(e["path"] == "資料夾A/子/深.txt"
+                  for e in snap["entries"]))
+    check("快照：上限截斷",
+          A.build_snapshot(callowed, max_entries=2)["truncated"] is True)
+    check("快照：發佈到中繼",
+          cagent.publish_snapshot()
+          and (lambda s: isinstance(s, dict)
+               and s["total_files"] == 6)(
+              crelay.get_json("snapshot.json")[0]))
+    # list_request：網頁要求重新整理，本地端重新產生快照並刪掉要求
+    crelay.put_json("list_request.json",
+                    {"request_id": "lr-test-1",
+                     "requested_at": "2026-11-22T00:00:00Z",
+                     "by": "admin"}, "test")
+    cagent.poll_once()
+    snap2, _ = crelay.get_json("snapshot.json")
+    check("快照：收到重新整理要求會重新產生",
+          isinstance(snap2, dict) and snap2["total_files"] == 6)
+    check("快照：重新整理要求用完會刪掉",
+          crelay.get_json("list_request.json")[0] is None)
+    # content_request：索取檔案內容
+    crelay.put_json("content_request.json",
+                    {"request_id": "cr-test-1", "path": "頂層.txt",
+                     "by": "admin", "at": "2026-11-22T00:00:00Z"}, "test")
+    cagent.poll_once()
+    resp, _ = crelay.get_json("content_response.json")
+    import base64 as _b64
+    check("索取內容：文字檔回傳正確",
+          isinstance(resp, dict) and resp.get("ok") is True
+          and _b64.b64decode(resp["content_b64"]).decode("utf-8")
+          == "頂層內容")
+    check("索取內容：要求用完會刪掉",
+          crelay.get_json("content_request.json")[0] is None)
+    crelay.put_json("content_request.json",
+                    {"request_id": "cr-test-2", "path": "沒有這個.txt",
+                     "by": "admin", "at": "2026-11-22T00:00:00Z"}, "test")
+    cagent.poll_once()
+    resp2, _ = crelay.get_json("content_response.json")
+    check("索取內容：找不到檔案回 error",
+          isinstance(resp2, dict) and resp2.get("ok") is False
+          and "找不到" in (resp2.get("error") or ""))
+    crelay.put_json("content_request.json",
+                    {"request_id": "cr-test-3", "path": "../逃.txt",
+                     "by": "admin", "at": "2026-11-22T00:00:00Z"}, "test")
+    cagent.poll_once()
+    resp3, _ = crelay.get_json("content_response.json")
+    check("索取內容：越界路徑被拒絕",
+          isinstance(resp3, dict) and resp3.get("ok") is False)
+    # 重新命名（管理員項目，不用工作階段核准）
+    crelay.put_json("pending/manifest.json", {"files": [
+        {"rel_path": "頂層.txt", "new_rel": "頂層改名.txt",
+         "action": "rename", "ai_name": "管理員", "by": "admin",
+         "time": "2026-11-22T00:00:00Z", "session_code": ""},
+    ]}, "test")
+    cagent._last_manifest_sig = None
+    cagent.poll_once()
+    check("重新命名：檔案改名成功",
+          os.path.exists(os.path.join(callowed, "頂層改名.txt"))
+          and not os.path.exists(os.path.join(callowed, "頂層.txt")))
+    hist = A.load_history()
+    check("重新命名：同步紀錄有寫 new_rel",
+          len(hist) >= 1 and hist[0]["items"][0].get("action") == "rename"
+          and hist[0]["items"][0].get("new_rel") == "頂層改名.txt")
+    rid = hist[0]["id"]
+    check("重新命名：返回改回原名",
+          cagent.undo_batch(rid)
+          and os.path.exists(os.path.join(callowed, "頂層.txt"))
+          and not os.path.exists(os.path.join(callowed, "頂層改名.txt")))
+    # 重新命名：新路徑跳脫、目標已存在，都要拒絕、不誤改
+    crelay.put_json("pending/manifest.json", {"files": [
+        {"rel_path": "頂層.txt", "new_rel": "../逃.txt",
+         "action": "rename", "ai_name": "管理員", "by": "admin",
+         "time": "2026-11-22T00:00:00Z", "session_code": ""},
+    ]}, "test")
+    cagent._last_manifest_sig = None
+    cagent.poll_once()
+    check("重新命名：新路徑跳脫被拒絕",
+          os.path.exists(os.path.join(callowed, "頂層.txt"))
+          and not os.path.exists(os.path.join(ctmp, "逃.txt")))
+    crelay.put_json("pending/manifest.json", {"files": [
+        {"rel_path": "頂層.txt", "new_rel": "圖.png",
+         "action": "rename", "ai_name": "管理員", "by": "admin",
+         "time": "2026-11-22T00:00:00Z", "session_code": ""},
+    ]}, "test")
+    cagent._last_manifest_sig = None
+    cagent.poll_once()
+    check("重新命名：目標已存在不覆蓋",
+          os.path.exists(os.path.join(callowed, "頂層.txt"))
+          and open(os.path.join(callowed, "圖.png"), "rb").read()
+          == b"\x89PNG1234")
+    # 資料夾刪除：整棵備份、刪掉、返回整棵回來
+    crelay.put_json("pending/manifest.json", {"files": [
+        {"rel_path": "刪我", "action": "delete", "is_dir": True,
+         "ai_name": "管理員", "by": "admin",
+         "time": "2026-11-22T00:00:00Z", "session_code": ""},
+    ]}, "test")
+    cagent._last_manifest_sig = None
+    cagent.poll_once()
+    check("資料夾刪除：整棵刪掉",
+          not os.path.exists(os.path.join(callowed, "刪我")))
+    hist = A.load_history()
+    check("資料夾刪除：同步紀錄標 is_dir",
+          len(hist) >= 1 and hist[0]["items"][0].get("is_dir") is True)
+    did = hist[0]["id"]
+    check("資料夾刪除：返回整棵回來",
+          cagent.undo_batch(did)
+          and os.path.exists(os.path.join(callowed, "刪我", "一.txt"))
+          and os.path.exists(os.path.join(callowed, "刪我", "二.txt")))
 
     print("=" * 40)
     print("結果：%d 通過，%d 失敗" % (PASS, FAIL))
