@@ -33,14 +33,11 @@
       <div><dt>最後心跳</dt><dd id="kv-heartbeat">—</dd></div>
     </dl>
     <p class="hint" id="status-hint">請先在 Windows 電腦上啟動 AI File，它會每 30 秒回報一次。</p>
-    <div id="connect-by-code" class="hidden">
-      <label for="admin-pat">用代碼連線（貼上 GitHub 細粒度 Token，只授權 ai-file-relay）</label>
-      <div class="row">
-        <input type="password" id="admin-pat" placeholder="github_pat_..." autocomplete="off">
-        <button id="btn-connect" class="btn btn-primary">連線</button>
-      </div>
-      <p class="hint">Token 只存在這個瀏覽器，不會上傳到任何地方。</p>
+    <div class="row">
+      <button id="btn-test-conn" class="btn btn-outline">測試連線</button>
+      <span class="hint" id="conn-test-result"></span>
     </div>
+    <p class="hint">如果顯示連線失敗，原因會直接寫在這裡（例如 Token 不對、權限不夠、找不到 repo）。</p>
   </section>
 
   <!-- 管理員介面 -->
@@ -48,6 +45,15 @@
     <h2>管理員介面</h2>
     <p class="hint">登入者：<span id="admin-user">—</span></p>
     <p class="warn">提醒：這裡的帳號密碼只是「這個瀏覽器的介面鎖」，不是伺服器驗證。真正的保護是：Token 只授權 ai-file-relay、工作階段代碼、以及你電腦上的本地端守門。</p>
+
+    <h3>GitHub 金鑰設定</h3>
+    <p class="hint">金鑰只設定一次，存在這個瀏覽器，之後 AI 登入只要工作階段代碼，不用再貼金鑰。</p>
+    <label for="admin-pat-setup">細粒度 Token（只授權 ai-file-relay）</label>
+    <div class="row">
+      <input type="password" id="admin-pat-setup" placeholder="github_pat_..." autocomplete="off">
+      <button id="btn-save-pat" class="btn btn-primary">儲存金鑰</button>
+    </div>
+    <p class="hint">狀態：<span id="pat-state">未設定</span>（基於安全，設定後不會顯示金鑰內容。）</p>
 
     <h3>工作階段代碼</h3>
     <p class="code-line">目前代碼：<code id="session-code">—</code></p>
@@ -96,11 +102,9 @@
   <!-- AI 登入 -->
   <section class="card hidden" id="ai-auth">
     <h2>AI 登入</h2>
-    <p>請輸入你的名稱，並貼上使用者給你的代碼。代碼是 GitHub 細粒度 Token，只授權私人中繼 repo「ai-file-relay」，用來把檔案暫存上去。</p>
+    <p>請輸入你的名稱和使用者給你的工作階段代碼。金鑰已經由管理員在這個瀏覽器設定過一次，不用再貼。</p>
     <label for="ai-name">AI 名稱</label>
     <input type="text" id="ai-name" placeholder="例如：Muse" autocomplete="off">
-    <label for="ai-pat">代碼（GitHub Token）</label>
-    <input type="password" id="ai-pat" placeholder="github_pat_..." autocomplete="off">
     <label for="ai-code">工作階段代碼</label>
     <input type="text" id="ai-code" placeholder="例如：A1B2-C3D4" autocomplete="off">
     <button id="btn-login-ai" class="btn btn-primary">送出連線請求</button>
@@ -158,8 +162,9 @@
   <section class="card" id="howto">
     <h2>怎麼用</h2>
     <ol>
-      <li>Windows 電腦：下載上面那包，雙擊「啟動 AI File.bat」，照設定精靈貼上 Token、選好允許的資料夾，拿到工作階段代碼。</li>
-      <li>把代碼給 AI（例如 Muse）。AI 在這個頁面點「AI 登入」，輸入名稱、貼上 Token 和代碼。</li>
+      <li>Windows 電腦：下載上面那包，雙擊「啟動 AI File.bat」，照設定精靈貼上 Token（只設定一次，存在電腦裡）、選好允許的資料夾，拿到工作階段代碼。第一次啟動會自動在桌面建立捷徑，也會自動檢查更新。</li>
+      <li>管理員第一次要在這個網頁的管理員介面設定一次 GitHub 金鑰（和本地端同一組）。</li>
+      <li>把工作階段代碼給 AI（例如 Muse）。AI 在這個頁面點「AI 登入」，輸入名稱和代碼就好，不用再貼 Token。</li>
       <li>你的電腦會跳通知，問你要不要允許連線。按「是」之後，AI 才能暫存檔案。</li>
       <li>AI 暫存的檔案會等在中繼 repo。你的電腦一看到待同步，就會跳「立即同步」讓你看過清單，按「同意」才會真的寫進電腦。</li>
       <li>隨時可以按本地端浮動視窗的「停止」，或在這裡的管理員介面按「停止」。停止後 AI 就動不到任何檔案。</li>
@@ -175,7 +180,7 @@
   </section>
 </main>
 
-<footer class="footer">AI File v1 — 檔案先暫存、你看過才同步、隨時能停止。</footer>
+<footer class="footer">AI File v1.2 — 檔案先暫存、你看過才同步、隨時能停止。</footer>
 <script src="app.js"></script>
 </body>
 </html>

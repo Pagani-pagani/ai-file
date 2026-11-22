@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""AI File 自我檢查 v1
-檢查設定檔、路徑守門、雜湊驗證、停止旗標、manifest 解析與連線。
+"""AI File 自我檢查 v1.2
+檢查設定檔、路徑守門、雜湊驗證、停止旗標、manifest 解析、版本比對與連線。
 用法：python 自我檢查.py
-全部 [OK] 才算通過；[警告] 表示不影響本機運作，但第一次使用前要處理。
+全部 [OK] 才算通過。第 10 步連線是正式檢查：失敗會印完整錯誤＋原因對照，
+沒有 PAT 也會明確講要先完成設定精靈，不是一句警告就帶過。
 """
 import json
 import os
@@ -164,18 +165,33 @@ def main():
     check("同步流程：越界檔案被拒絕，沒有寫出去",
           not os.path.exists(os.path.join(tmp, "escape.txt")))
 
-    # 10. 連線（只有設定過 PAT 才測）
+    # 10. 連線（正式檢查，不是警告：失敗要印完整錯誤＋原因對照）
     if cfg and cfg.get("pat"):
         try:
             r = A.GitHubRelay(cfg["pat"])
-            hb, _ = r.get_json("heartbeat.json")
-            check("中繼 repo 連線成功", True)
-            if hb is None:
-                warn("中繼還沒有心跳", "本地端還沒啟動過")
+            ok, msg = A.test_connection(r)
+            check("中繼 repo 連線", ok, msg if not ok else "")
+            if ok:
+                print("    " + msg)
+            else:
+                print("    原因對照：")
+                for line in A.CONNECTION_CAUSES.split("\n"):
+                    print("    " + line)
         except Exception as e:
-            warn("中繼 repo 連線失敗", str(e)[:120])
+            check("中繼 repo 連線", False, "完整錯誤：%s" % e)
     else:
-        warn("未測中繼連線", "還沒有 PAT，先完成設定精靈")
+        check("中繼 repo 連線", False,
+              "還沒設定 PAT，請先完成設定精靈"
+              "（需要先去 GitHub 產生細粒度 Token）")
+
+    # 11. 版本比對
+    check("版本比對：1.2 > 1.1",
+          A.parse_version("1.2") > A.parse_version("1.1"))
+    check("版本比對：1.10 > 1.2",
+          A.parse_version("1.10") > A.parse_version("1.2"))
+    check("版本比對：1.2 == 1.2",
+          A.parse_version("1.2") == A.parse_version("1.2"))
+    check("VERSION 是 1.2", A.VERSION == "1.2")
 
     print("=" * 40)
     print("結果：%d 通過，%d 失敗" % (PASS, FAIL))

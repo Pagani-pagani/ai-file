@@ -1,6 +1,7 @@
-/* AI File v1 — 網頁版
+/* AI File v1.2 — 網頁版
  * 靜態 SPA，跑在 GitHub Pages 上，沒有後端伺服器。
- * 所有 GitHub API 呼叫都用瀏覽器 localStorage 裡的 Token，
+ * GitHub 金鑰只由管理員設定一次，存在瀏覽器 localStorage（aifile_pat）；
+ * AI 登入只要工作階段代碼，不用再貼金鑰。
  * 絕對不要把任何 Token、密碼寫死在程式碼裡。
  * 網頁只能把檔案「暫存」到私人中繼 repo，真正寫進電腦的動作
  * 永遠由本地端程式在使用者按「同意」後才做。
@@ -74,15 +75,27 @@ function ghHeaders(pat) {
 function ghPath(path) {
   return path.split("/").map(encodeURIComponent).join("/");
 }
+// 把 HTTP 狀態翻成中文原因，連線失敗時一眼就知道是 Token 問題還是程式問題
+function apiErrorReason(status) {
+  if (status === 401) return "401：Token 不對或已過期，請重新產生 Token";
+  if (status === 403) return "403：Token 權限不夠或沒有授權 ai-file-relay，請檢查 Token 設定";
+  if (status === 404) return "404：找不到 repo 或 Token 看不到這個 repo，請檢查 repo 名稱與 Token 授權";
+  return "HTTP " + status;
+}
 // 讀一個檔案：回傳 {data, sha}；不存在回傳 {data: null, sha: null}
 function ghGetFile(pat, path) {
   return fetch(API_BASE + "/" + ghPath(path), { headers: ghHeaders(pat) })
     .then(function (res) {
       if (res.status === 404) return { data: null, sha: null };
-      if (!res.ok) throw new Error("讀取 " + path + " 失敗（HTTP " + res.status + "）");
+      if (!res.ok) throw new Error("讀取 " + path + " 失敗（" + apiErrorReason(res.status) + "）");
       return res.json().then(function (j) {
         return { data: b64ToUtf8(j.content || ""), sha: j.sha };
       });
+    })
+    .catch(function (e) {
+      // 我們自己丟的 HTTP 錯誤原樣往上丟；其他（例如連不上）才翻成中文
+      if (e && e.message && e.message.indexOf("讀取 ") === 0) throw e;
+      throw new Error("連不上 api.github.com，請檢查網路或防火牆");
     });
 }
 function ghGetJson(pat, path) {
@@ -102,7 +115,7 @@ function ghPutFile(pat, path, contentB64, message) {
     }).then(function (res) {
       if (!res.ok) {
         return res.json().catch(function () { return {}; }).then(function (j) {
-          throw new Error("寫入 " + path + " 失敗（HTTP " + res.status + "）" +
+          throw new Error("寫入 " + path + " 失敗（" + apiErrorReason(res.status) + "）" +
             (j.message ? "：" + j.message : ""));
         });
       }
@@ -137,16 +150,24 @@ function appendActivity(pat, entry) {
 var state = {
   pat: localStorage.getItem("aifile_pat") || "",
   adminAuthed: false,
-  ai: null,          // {name, pat, code}
+  ai: null,          // {name, code}：金鑰不再存在 AI 登入裡
   sessionPoll: null,
   statusTimer: null
 };
 try {
   var savedAi = JSON.parse(localStorage.getItem("aifile_ai") || "null");
-  if (savedAi && savedAi.name && savedAi.pat && savedAi.code) state.ai = savedAi;
+  if (savedAi && savedAi.name && savedAi.code) {
+    // v1.2：舊版存過 pat 的瀏覽器自動清掉，只留名稱和代碼
+    if (savedAi.pat) {
+      delete savedAi.pat;
+      localStorage.setItem("aifile_ai", JSON.stringify(savedAi));
+    }
+    state.ai = { name: savedAi.name, code: savedAi.code };
+  }
 } catch (e) { /* 忽略損壞的暫存 */ }
 
-function pat() { return state.pat || (state.ai && state.ai.pat) || ""; }
+// 金鑰只從管理員設定讀（localStorage aifile_pat），AI 登入不再帶金鑰
+function pat() { return state.pat || ""; }
 function savePat(p) {
   state.pat = p;
   localStorage.setItem("aifile_pat", p);
@@ -156,11 +177,9 @@ function savePat(p) {
 function refreshStatus() {
   var p = pat();
   if (!p) {
-    setStatus("grey", "尚未連線", "請先貼上 Token 連線（管理員介面或 AI 登入）。");
-    show($("connect-by-code"));
+    setStatus("grey", "尚未設定金鑰", "請管理員先在管理員介面設定 GitHub 金鑰（只需設定一次）。");
     return Promise.resolve();
   }
-  hide($("connect-by-code"));
   return ghGetJson(p, "heartbeat.json").then(function (r) {
     var hb = r.data;
     if (!hb || hb.status === "never" || !hb.updated_at) {
@@ -186,7 +205,7 @@ function refreshStatus() {
     $("ai-folder").textContent = hb.folder_name || hb.allowed_folder || "—";
     if (hb.session_code) $("session-code").textContent = hb.session_code;
   }).catch(function (e) {
-    setStatus("red", "讀取狀態失敗", String(e.message || e) + "。請檢查 Token 是否正確、而且只授權 ai-file-relay。");
+    setStatus("red", "連線失敗", String(e.message || e));
   });
 }
 function setStatus(color, text, hint) {
@@ -242,8 +261,43 @@ function loginAdmin() {
   }).catch(function (e) { notice(String(e.message || e), "err"); });
 }
 
+/* ---------- 管理員：GitHub 金鑰設定（只設定一次） ---------- */
+function updatePatState() {
+  var el = $("pat-state");
+  if (el) el.textContent = state.pat ? "已設定" : "未設定";
+}
+function savePatKey() {
+  var v = $("admin-pat-setup").value.trim();
+  if (!v) return notice("請先貼上 GitHub 細粒度 Token。", "err");
+  savePat(v);
+  $("admin-pat-setup").value = "";
+  updatePatState();
+  notice("GitHub 金鑰已設定（只存在這個瀏覽器）。之後 AI 登入只要工作階段代碼，不用再貼金鑰。", "ok");
+  refreshStatus();
+}
+function testConnection() {
+  var p = pat();
+  if (!p) {
+    $("conn-test-result").textContent = "還沒設定 GitHub 金鑰，請管理員先在上方設定（只需設定一次）。";
+    return;
+  }
+  $("conn-test-result").textContent = "測試中…";
+  ghGetJson(p, "heartbeat.json").then(function (r) {
+    if (!r.data || !r.data.updated_at) {
+      $("conn-test-result").textContent = "連線成功，但中繼還沒有心跳（本地端還沒啟動過）。";
+    } else {
+      $("conn-test-result").textContent = "已連線，最後心跳：" + r.data.updated_at.replace("T", " ").replace("Z", " UTC");
+    }
+    refreshStatus();
+  }).catch(function (e) {
+    $("conn-test-result").textContent = "連線失敗：" + String(e.message || e);
+    refreshStatus();
+  });
+}
+
 /* ---------- 管理員介面 ---------- */
 function loadAdminData() {
+  updatePatState();
   refreshStatus();
   refreshPending();
   refreshActivity();
@@ -318,7 +372,7 @@ function refreshActivity() {
 }
 function regenCode() {
   var p = pat();
-  if (!p) return notice("請先用代碼連線（貼上 Token）。", "err");
+  if (!p) return notice("請先在管理員介面設定 GitHub 金鑰（只需設定一次）。", "err");
   if (!confirm("確定要重新生成工作階段代碼嗎？舊代碼會立刻失效，尚未同步的暫存也會被拒收。")) return;
   ghPutJson(p, "regen.json", { requested: true, at: utcnow(), by: "web" }, "AI File：請求重新生成代碼")
     .then(function () {
@@ -329,7 +383,7 @@ function regenCode() {
 }
 function setStopped(stopped) {
   var p = pat();
-  if (!p) return notice("請先用代碼連線（貼上 Token）。", "err");
+  if (!p) return notice("請先在管理員介面設定 GitHub 金鑰（只需設定一次）。", "err");
   ghPutJson(p, "stop.json", { stopped: stopped, by: "web", at: utcnow() }, stopped ? "AI File：網頁版按下停止" : "AI File：網頁版按下恢復")
     .then(function () {
       appendActivity(p, { action: stopped ? "stopped" : "resumed", ai_name: "", detail: stopped ? "管理員在網頁版按下停止" : "管理員在網頁版按下恢復" });
@@ -342,19 +396,18 @@ function setStopped(stopped) {
 /* ---------- AI 登入 ---------- */
 function aiLogin() {
   var name = $("ai-name").value.trim();
-  var patVal = $("ai-pat").value.trim();
   var code = $("ai-code").value.trim().toUpperCase();
   if (!name) return notice("請輸入 AI 名稱。", "err");
-  if (!patVal) return notice("請貼上代碼（GitHub Token）。", "err");
   if (!code) return notice("請輸入工作階段代碼。", "err");
-  savePat(patVal);
-  ghGetJson(patVal, "session.json").then(function (r) {
+  var p = pat();
+  if (!p) return notice("這個瀏覽器還沒設定 GitHub 金鑰，請管理員先在上方設定（只需設定一次）；或直接把工作階段代碼在對話裡給 Muse，Muse 會用自己的連線處理。", "err");
+  ghGetJson(p, "session.json").then(function (r) {
     if (!r.data || !r.data.code_hash) {
       throw new Error("本地端尚未產生工作階段代碼，請先在 Windows 電腦上完成 AI File 的第一次設定。");
     }
     return sha256Hex(code).then(function (h) {
       if (h !== r.data.code_hash) throw new Error("工作階段代碼不對，請跟使用者確認最新的一組代碼。");
-      return ghPutJson(patVal, "session.json", {
+      return ghPutJson(p, "session.json", {
         status: "waiting",
         ai_name: name,
         code_hash: r.data.code_hash,
@@ -362,7 +415,7 @@ function aiLogin() {
       }, "AI File：" + name + " 請求連線");
     });
   }).then(function () {
-    state.ai = { name: name, pat: patVal, code: code };
+    state.ai = { name: name, code: code };
     localStorage.setItem("aifile_ai", JSON.stringify(state.ai));
     notice("已送出連線請求，請等使用者在他的電腦上按「是」。", "info");
     $("ai-session-state").textContent = "工作階段狀態：等待使用者按「是」…";
@@ -373,7 +426,7 @@ function pollSession() {
   if (state.sessionPoll) clearInterval(state.sessionPoll);
   state.sessionPoll = setInterval(function () {
     if (!state.ai) { clearInterval(state.sessionPoll); return; }
-    ghGetJson(state.ai.pat, "session.json").then(function (r) {
+    ghGetJson(pat(), "session.json").then(function (r) {
       var s = r.data || {};
       if (s.status === "approved") {
         clearInterval(state.sessionPoll);
@@ -394,7 +447,7 @@ function pollSession() {
 
 /* ---------- 暫存檔案 ---------- */
 function checkStagingReady() {
-  var p = state.ai.pat;
+  var p = pat();
   return ghGetJson(p, "stop.json").then(function (r) {
     if (r.data && r.data.stopped) throw new Error("目前是停止狀態，無法暫存。請使用者先恢復。");
     return ghGetJson(p, "session.json");
@@ -425,7 +478,7 @@ function pendingFileName(rel, index, sha) {
 }
 function stageEntry(entry, fileB64) {
   // entry: {rel_path, action, sha256, size, file(pending 名稱或 null)}
-  var p = state.ai.pat;
+  var p = pat();
   var putFile = entry.file
     ? ghPutFile(p, "pending/" + entry.file, fileB64, "AI File：" + state.ai.name + " 暫存 " + entry.rel_path)
     : Promise.resolve();
@@ -537,7 +590,7 @@ function stageDelete() {
 }
 function refreshMyStaged() {
   if (!state.ai) return;
-  ghGetJson(state.ai.pat, "pending/manifest.json").then(function (r) {
+  ghGetJson(pat(), "pending/manifest.json").then(function (r) {
     var files = ((r.data && r.data.files) || []).filter(function (f) {
       return f.ai_name === state.ai.name;
     });
@@ -574,7 +627,6 @@ $("btn-ai").addEventListener("click", function () {
   if (state.ai) {
     show($("ai-panel"));
     $("ai-name").value = state.ai.name;
-    $("ai-pat").value = state.ai.pat;
     $("ai-code").value = state.ai.code;
     $("ai-session-state").textContent = "工作階段狀態：已登入（" + state.ai.name + "）";
     refreshMyStaged(); pollSession();
@@ -587,19 +639,12 @@ $("btn-logout").addEventListener("click", function () {
   localStorage.removeItem("aifile_ai");
   if (state.sessionPoll) clearInterval(state.sessionPoll);
   hide($("admin-panel")); hide($("ai-panel")); hide($("admin-auth")); hide($("ai-auth"));
-  notice("已登出。Token 仍留在瀏覽器裡，下次登入不用重貼。", "info");
+  notice("已登出。GitHub 金鑰仍留在瀏覽器裡（管理員設定），下次不用重設。", "info");
 });
 $("btn-setup-admin").addEventListener("click", setupAdmin);
 $("btn-login-admin").addEventListener("click", loginAdmin);
-$("btn-connect").addEventListener("click", function () {
-  var p = $("admin-pat").value.trim();
-  if (!p) return notice("請先貼上 Token。", "err");
-  savePat(p);
-  notice("已儲存 Token，正在檢查連線…", "info");
-  refreshStatus().then(function () {
-    if (state.adminAuthed) { refreshPending(); refreshActivity(); refreshStopState(); }
-  });
-});
+$("btn-save-pat").addEventListener("click", savePatKey);
+$("btn-test-conn").addEventListener("click", testConnection);
 $("btn-regen").addEventListener("click", regenCode);
 $("btn-stop").addEventListener("click", function () { setStopped(true); });
 $("btn-resume").addEventListener("click", function () { setStopped(false); });
@@ -616,12 +661,12 @@ if (state.ai) {
   show($("btn-logout"));
   show($("ai-panel"));
   $("ai-name").value = state.ai.name;
-  $("ai-pat").value = state.ai.pat;
   $("ai-code").value = state.ai.code;
   $("ai-session-state").textContent = "工作階段狀態：已登入（" + state.ai.name + "）";
   refreshMyStaged();
   pollSession();
 }
 if (adminHashExists() && state.pat) { /* 管理員已設定過，點右上角登入即可 */ }
+updatePatState();
 refreshStatus();
 state.statusTimer = state.statusTimer || setInterval(refreshStatus, 30000);

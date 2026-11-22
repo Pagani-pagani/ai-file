@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI File 本地端程式 v1
+AI File 本地端程式 v1.2
 ===================
 讓 Muse 把檔案直接送到你的 Windows 電腦。
 架構：網頁版只能把檔案暫存到私人中繼 repo（ai-file-relay），
@@ -21,22 +21,54 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timezone
 
-VERSION = "1"
+VERSION_DEFAULT = "1.2"
 RELAY_OWNER = "Pagani-pagani"
 RELAY_REPO = "ai-file-relay"
 GITHUB_API = "https://api.github.com"
+PUBLIC_RAW_VERSION_URL = (
+    "https://raw.githubusercontent.com/Pagani-pagani/ai-file/main/VERSION")
+PUBLIC_ZIP_URL = (
+    "https://codeload.github.com/Pagani-pagani/ai-file/zip/refs/heads/main")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "ai-file-config.json")
 LOG_FILE = os.path.join(BASE_DIR, "ai-file-log.txt")
+UPDATE_BAT = os.path.join(BASE_DIR, "更新 AI File.bat")
+
+# 連線失敗的原因對照表（自我檢查、設定精靈、浮動視窗共用）
+CONNECTION_CAUSES = (
+    "・401：Token 不對或已過期，請重新產生 Token\n"
+    "・403：Token 權限不夠或沒有授權 ai-file-relay，請檢查 Token 設定\n"
+    "・404：找不到 repo 或 Token 看不到這個 repo，請檢查 repo 名稱與 Token 授權\n"
+    "・連不上：網路或防火牆擋住 api.github.com，請檢查網路")
+
+
+def _load_version():
+    """啟動時讀 repo 根目錄的 VERSION 檔案，讀不到才用內建常數。"""
+    try:
+        with open(os.path.join(os.path.dirname(BASE_DIR), "VERSION"),
+                  "r", encoding="utf-8") as f:
+            v = f.read().strip()
+            if v:
+                return v
+    except OSError:
+        pass
+    return VERSION_DEFAULT
+
+
+VERSION = _load_version()
 
 POLL_INTERVAL = 5        # 即時模式輪詢秒數
 HEARTBEAT_INTERVAL = 30  # 心跳秒數
@@ -148,7 +180,31 @@ def log_local(message):
 
 # ---------------------------------------------------------------- 中繼 repo 存取
 class RelayError(Exception):
-    pass
+    """中繼連線錯誤。status 是 HTTP 狀態碼（None 表示連不上伺服器）。"""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+def relay_error_reason(exc):
+    """把連線錯誤翻成中文原因，方便一眼看出是 Token 問題還是程式問題。"""
+    status = getattr(exc, "status", None)
+    msg = str(exc)
+    if status is None:
+        for code in ("401", "403", "404"):
+            if code in msg:
+                status = int(code)
+                break
+    if status == 401:
+        return "401：Token 不對或已過期，請重新產生 Token"
+    if status == 403:
+        return "403：Token 權限不夠或沒有授權 ai-file-relay，請檢查 Token 設定"
+    if status == 404:
+        return "404：找不到 repo 或 Token 看不到這個 repo，請檢查 repo 名稱與 Token 授權"
+    if "連不上" in msg:
+        return "連不上 GitHub（網路或防火牆可能擋住 api.github.com）"
+    return msg
 
 
 class RelayClient:
@@ -171,19 +227,28 @@ class RelayClient:
 
 
 class GitHubRelay(RelayClient):
-    """用 GitHub Contents API 讀寫私人中繼 repo。PAT 只從設定檔讀，絕不寫進程式碼。"""
+    """用 GitHub Contents API 讀寫私人中繼 repo。PAT 只從設定檔讀，絕不寫進程式碼。
 
-    def __init__(self, pat, owner=RELAY_OWNER, repo=RELAY_REPO):
+    api_base 可以注入（環境變數 AI_FILE_API_BASE 或參數），測試時用本機假 API
+    伺服器驗證；預設仍是 api.github.com。每次請求的結果會記在 last_error，
+    讓浮動視窗的連線狀態行知道最後一次是成功還是失敗。
+    """
+
+    def __init__(self, pat, owner=RELAY_OWNER, repo=RELAY_REPO,
+                 api_base=None):
         self.pat = pat
         self.owner = owner
         self.repo = repo
+        self.api_base = api_base or os.environ.get("AI_FILE_API_BASE") \
+            or GITHUB_API
+        self.last_error = None
 
     def _url(self, path):
         parts = "/".join(
             urllib.request.quote(seg, safe="") for seg in path.split("/")
         )
         return "%s/repos/%s/%s/contents/%s" % (
-            GITHUB_API, self.owner, self.repo, parts)
+            self.api_base, self.owner, self.repo, parts)
 
     def _request(self, method, path, body=None):
         req = urllib.request.Request(self._url(path), method=method)
@@ -196,15 +261,40 @@ class GitHubRelay(RelayClient):
             req.add_header("Content-Type", "application/json")
         try:
             with urllib.request.urlopen(req, data=data, timeout=30) as resp:
+                self.last_error = None
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code == 404:
+                # 檔案不存在是正常情況（例如還沒有心跳），不是連線失敗
+                self.last_error = None
                 return None
             detail = e.read().decode("utf-8", "replace")[:300]
-            raise RelayError("GitHub API %s %s 失敗（%s）：%s" % (
-                method, path, e.code, detail))
+            err = RelayError("GitHub API %s %s 失敗（%s）：%s" % (
+                method, path, e.code, detail), status=e.code)
+            self.last_error = err
+            raise err
         except urllib.error.URLError as e:
-            raise RelayError("連不上 GitHub：%s" % e.reason)
+            err = RelayError("連不上 GitHub：%s" % e.reason)
+            self.last_error = err
+            raise err
+
+    def check_repo(self):
+        """檢查 Token 能不能看到中繼 repo。回傳 (ok, 原因說明)。
+        用來分辨「檔案還沒建立」和「repo／Token 有問題」。"""
+        url = "%s/repos/%s/%s" % (self.api_base, self.owner, self.repo)
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("Authorization", "Bearer " + self.pat)
+        req.add_header("User-Agent", "AI-File-Agent/" + VERSION)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+                return True, "repo 存在，Token 看得到"
+        except urllib.error.HTTPError as e:
+            return False, relay_error_reason(
+                RelayError("HTTP %s" % e.code, status=e.code))
+        except urllib.error.URLError as e:
+            return False, "連不上 GitHub：%s" % e.reason
 
     def get_json(self, path):
         res = self._request("GET", path)
@@ -313,6 +403,155 @@ def append_activity(relay, entry):
         log_local("寫入 activity.json 失敗：%s" % e)
 
 
+def test_connection(relay):
+    """測試連線。回傳 (ok, 訊息)，訊息直接講得出原因。
+    heartbeat.json 不存在時，再用 check_repo 分辨是「檔案還沒建立」
+    還是「repo／Token 有問題」。"""
+    try:
+        hb, _ = relay.get_json("heartbeat.json")
+    except RelayError as e:
+        return False, relay_error_reason(e)
+    except Exception as e:
+        return False, str(e)
+    if hb is None:
+        if hasattr(relay, "check_repo"):
+            ok, reason = relay.check_repo()
+            if not ok:
+                return False, reason
+        return True, "連線成功，但中繼還沒有心跳（本地端還沒啟動過）"
+    if isinstance(hb, dict):
+        return True, "連線成功，最後心跳：%s" % hb.get("updated_at", "—")
+    return True, "連線成功"
+
+
+def create_desktop_shortcut():
+    """在桌面建立 AI File.lnk（不用 pywin32，用 Windows 內建 WScript.Shell）。
+    目標是程式資料夾裡的「啟動 AI File.vbs」（隱藏啟動，不跳黑窗）。
+    成功回傳 True；非 Windows 或失敗回傳 False（失敗只寫 log）。"""
+    if os.name != "nt":
+        log_local("建立桌面捷徑：只支援 Windows，本機是 %s，跳過" % os.name)
+        return False
+    target = os.path.join(BASE_DIR, "啟動 AI File.vbs")
+    vbs_text = (
+        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        'DesktopPath = WshShell.SpecialFolders("Desktop")\r\n'
+        'Set oLink = WshShell.CreateShortcut(DesktopPath & "\\AI File.lnk")\r\n'
+        'oLink.TargetPath = "%s"\r\n'
+        'oLink.WorkingDirectory = "%s"\r\n'
+        'oLink.Description = "AI File：讓 AI 把檔案送到你的電腦"\r\n'
+        'oLink.Save\r\n' % (target, BASE_DIR)
+    )
+    tmp_vbs = None
+    try:
+        fd, tmp_vbs = tempfile.mkstemp(suffix=".vbs", prefix="aifile_shortcut_")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(vbs_text)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.run(
+            ["cscript", "//nologo", tmp_vbs],
+            capture_output=True, timeout=30, creationflags=flags)
+        if proc.returncode != 0:
+            log_local("建立桌面捷徑失敗：%s" % proc.stderr.decode(
+                "utf-8", "replace")[:200])
+            return False
+        log_local("已建立桌面捷徑：AI File.lnk")
+        return True
+    except Exception as e:
+        log_local("建立桌面捷徑失敗：%s" % e)
+        return False
+    finally:
+        if tmp_vbs:
+            try:
+                os.remove(tmp_vbs)
+            except OSError:
+                pass
+
+
+def parse_version(text):
+    """版本字串轉 tuple(int)，例如 "1.10" -> (1, 10)，比大小才不會錯
+    （字串比會把 1.10 誤判成比 1.2 小）。"""
+    parts = []
+    for piece in str(text).strip().split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts) if parts else (0,)
+
+
+def check_for_update(version_url=None):
+    """檢查公開 repo 有沒有新版。回傳 (有新版, 遠端版本字串或 None)。
+    任何失敗都回傳 (False, None)，絕對不丟例外、不擋啟動。"""
+    url = version_url or PUBLIC_RAW_VERSION_URL
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "AI-File-Agent/" + VERSION})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            remote = resp.read().decode("utf-8").strip()
+        if not remote:
+            return False, None
+        return parse_version(remote) > parse_version(VERSION), remote
+    except Exception as e:
+        log_local("檢查更新失敗（不影響使用）：%s" % e)
+        return False, None
+
+
+def perform_update(remote_version, zip_url=None):
+    """下載新版 zip、驗證、寫好更新批次檔。成功回傳 True（呼叫端接著退出程式），
+    失敗回傳 False（繼續用舊版）。更新只覆蓋 agent/ 的檔案，絕對不動
+    ai-file-config.json 和 ai-file-log.txt（它們本來就不在 repo 裡）。"""
+    url = zip_url or PUBLIC_ZIP_URL
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "AI-File-Agent/" + VERSION})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = resp.read()
+        tmp_zip = os.path.join(tempfile.gettempdir(), "aifile_update.zip")
+        with open(tmp_zip, "wb") as f:
+            f.write(data)
+        tmp_dir = tempfile.mkdtemp(prefix="aifile_update_")
+        with zipfile.ZipFile(tmp_zip) as z:
+            names = z.namelist()
+            if "ai-file-main/agent/ai_file_agent.py" not in names:
+                raise ValueError("下載的 zip 裡沒有 agent/ai_file_agent.py，格式不對")
+            for name in names:
+                if name.startswith("ai-file-main/agent/") \
+                        and not name.endswith("/"):
+                    z.extract(name, tmp_dir)
+        src = os.path.join(tmp_dir, "ai-file-main", "agent")
+        # 更新批次檔：等 agent 完全退出、覆蓋 agent/、刪暫存、重啟
+        bat = (
+            "@echo off\r\n"
+            "chcp 65001 >nul\r\n"
+            "ping -n 4 127.0.0.1 >nul\r\n"
+            "xcopy /E /Y /Q \"%s\" \"%s\\\"\r\n"
+            "rmdir /S /Q \"%s\"\r\n"
+            "del \"%s\"\r\n"
+            "start \"\" wscript \"%s\"\r\n"
+            "del \"%%~f0\"\r\n" % (
+                src, BASE_DIR, tmp_dir, tmp_zip,
+                os.path.join(BASE_DIR, "啟動 AI File.vbs"))
+        )
+        with open(UPDATE_BAT, "w", encoding="utf-8") as f:
+            f.write(bat)
+        log_local("已下載 v%s，更新批次檔就緒" % remote_version)
+        return True
+    except Exception as e:
+        log_local("自動更新失敗（繼續使用舊版）：%s" % e)
+        return False
+
+
+def run_updater_and_exit():
+    """啟動更新批次檔（讓它在背景跑），呼叫端接著退出程式。"""
+    try:
+        if os.name == "nt":
+            os.startfile(UPDATE_BAT)
+        else:
+            subprocess.Popen(["cmd", "/c", UPDATE_BAT])
+    except Exception as e:
+        log_local("啟動更新批次檔失敗：%s" % e)
+
+
 # ---------------------------------------------------------------- UI（tkinter）
 class TkUI:
     """桌面通知、確認對話框、浮動視窗。全部 tkinter，Windows 與 Linux 共用。"""
@@ -323,7 +562,22 @@ class TkUI:
         self.float_win = None
         self.float_list = None
         self.float_status = None
+        self.float_conn = None
         self.float_code = None
+
+    def call_on_main(self, fn):
+        """背景執行緒想動介面時用這個，保證在主執行緒跑。"""
+        try:
+            self.root.after(0, fn)
+        except Exception:
+            fn()
+
+    def quit_app(self):
+        """1.5 秒後關掉主視窗（更新流程用，讓「正在更新」先顯示一下）。"""
+        try:
+            self.root.after(1500, self.root.destroy)
+        except Exception:
+            pass
 
     # -- 通知與確認 ------------------------------------------------
     def notify(self, title, message):
@@ -391,7 +645,7 @@ class TkUI:
         win = tk.Toplevel(self.root)
         win.title("AI File")
         win.attributes("-topmost", True)
-        win.geometry("420x360+40+40")
+        win.geometry("420x440+40+40")
         win.protocol("WM_DELETE_WINDOW", win.withdraw)
         ttk.Label(win, text="AI File — 正在監控",
                   font=("Microsoft JhengHei", 12, "bold")).pack(
@@ -399,6 +653,9 @@ class TkUI:
         self.float_status = ttk.Label(win, text="狀態：啟動中…",
                                       font=("Microsoft JhengHei", 10))
         self.float_status.pack(anchor="w", padx=12)
+        self.float_conn = ttk.Label(win, text="連線狀態：—",
+                                    font=("Microsoft JhengHei", 10))
+        self.float_conn.pack(anchor="w", padx=12)
         self.float_code = ttk.Label(win, text="工作階段代碼：—",
                                     font=("Microsoft JhengHei", 10))
         self.float_code.pack(anchor="w", padx=12, pady=(0, 6))
@@ -409,6 +666,20 @@ class TkUI:
         frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         self.float_list = tk.Listbox(frame, font=("Microsoft JhengHei", 10))
         self.float_list.pack(fill="both", expand=True)
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Button(btns, text="建立桌面捷徑",
+                   command=self.agent.create_shortcut_manual
+                   ).pack(side="left", padx=(0, 4))
+        ttk.Button(btns, text="檢查更新",
+                   command=self.agent.check_update_manual
+                   ).pack(side="left", padx=(0, 4))
+        ttk.Button(btns, text="測試連線",
+                   command=self.agent.test_connection_manual
+                   ).pack(side="left", padx=(0, 4))
+        ttk.Button(btns, text="重設資料",
+                   command=self.agent.reset_data
+                   ).pack(side="left")
         stop_btn = tk.Button(
             win, text="■ 停止", font=("Microsoft JhengHei", 14, "bold"),
             bg="#c0392b", fg="white", height=2,
@@ -441,6 +712,13 @@ class TkUI:
             except Exception:
                 pass
 
+    def set_conn(self, text):
+        if self.float_conn is not None:
+            try:
+                self.float_conn.config(text="連線狀態：" + text)
+            except Exception:
+                pass
+
     def set_code(self, code):
         if self.float_code is not None:
             try:
@@ -456,6 +734,13 @@ class HeadlessUI:
         self.approve = approve
         self.notices = []
         self.activities = []
+        self.quit_requested = False
+
+    def call_on_main(self, fn):
+        fn()
+
+    def quit_app(self):
+        self.quit_requested = True
 
     def notify(self, title, message):
         self.notices.append((title, message))
@@ -478,6 +763,9 @@ class HeadlessUI:
     def set_status(self, text):
         print("[狀態] " + text)
 
+    def set_conn(self, text):
+        print("[連線狀態] " + text)
+
     def set_code(self, code):
         print("[代碼] " + code)
 
@@ -491,10 +779,138 @@ class Agent:
         self.allowed_folder = config.get("allowed_folder", "")
         self.session_code = config.get("session_code", "")
         self.stopped = False
+        self._resetting = False
         self._last_manifest_sig = None
         self._seen_waiting = set()
         self._last_heartbeat = 0
         self._pending_notice_sig = None
+        self._last_poll_ok_at = 0
+        self._last_poll_error = ""
+
+    # -- 連線狀態 --------------------------------------------------
+    def _note_conn_ok(self):
+        self._last_poll_ok_at = time.time()
+        self._last_poll_error = ""
+        self.ui.set_conn("連線正常，最後成功：%s" % time.strftime(
+            "%H:%M:%S", time.localtime(self._last_poll_ok_at)))
+
+    def _note_conn_error(self, exc):
+        self._last_poll_error = relay_error_reason(exc)
+        self.ui.set_conn("連線失敗：" + self._last_poll_error)
+
+    def _note_conn_error_text(self, text):
+        self._last_poll_error = text
+        self.ui.set_conn("連線失敗：" + text)
+
+    def _refresh_conn_status(self):
+        """每輪結束後看 relay 的 last_error，更新連線狀態行。
+        輪詢失敗不再只寫 log，浮動視窗直接看得到原因。"""
+        err = getattr(self.relay, "last_error", None)
+        if err is not None:
+            self._note_conn_error(err)
+        else:
+            self._note_conn_ok()
+
+    # -- 桌面捷徑／更新／測試連線／重設 ---------------------------
+    def create_shortcut_manual(self):
+        def work():
+            ok = create_desktop_shortcut()
+            self.ui.call_on_main(lambda: self.ui.notify(
+                "AI File",
+                "已建立桌面捷徑：AI File.lnk" if ok
+                else "建立桌面捷徑失敗，請看 ai-file-log.txt"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def check_update_manual(self):
+        """手動檢查更新：只檢查，有新版才問要不要更新。"""
+        def work():
+            has_new, remote = check_for_update()
+
+            def done():
+                if not has_new:
+                    self.ui.notify("AI File",
+                                   "已經是最新版（v%s）。" % VERSION)
+                    return
+                if self.ui.ask_yes_no(
+                        "AI File：有新版 v%s" % remote,
+                        "目前是 v%s，有新版 v%s，要現在更新嗎？\n"
+                        "更新完會自動重開。" % (VERSION, remote)):
+                    if perform_update(remote):
+                        self.ui.set_status("正在更新到 v%s…" % remote)
+                        run_updater_and_exit()
+                        self.ui.quit_app()
+                    else:
+                        self.ui.notify(
+                            "AI File",
+                            "更新失敗，請看 ai-file-log.txt，繼續用舊版。")
+            self.ui.call_on_main(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def test_connection_manual(self):
+        def work():
+            ok, msg = test_connection(self.relay)
+
+            def done():
+                if ok:
+                    self._note_conn_ok()
+                else:
+                    self._note_conn_error_text(msg)
+                self.ui.notify("AI File：測試連線", msg)
+            self.ui.call_on_main(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def reset_data(self, wizard_fn=None):
+        """重設資料：確認後停止輪詢、刪除設定與紀錄檔、重新開設定精靈。
+        本機資料只有程式資料夾裡的 ai-file-config.json 和 ai-file-log.txt，
+        沒有登錄檔、沒有 AppData。"""
+        ok = self.ui.ask_yes_no(
+            "AI File：重設資料",
+            "確定要清除全部本機資料嗎？\n\n會刪除：\n"
+            "・GitHub Token\n"
+            "・允許的資料夾\n"
+            "・工作階段代碼\n"
+            "・本機紀錄（ai-file-log.txt）\n\n"
+            "刪除後會重新打開第一次設定精靈。")
+        if not ok:
+            return False
+        self._resetting = True
+        self.stopped = True
+        for path in (CONFIG_FILE, LOG_FILE):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as e:
+                log_local("刪除 %s 失敗：%s" % (path, e))
+        # 注意：這裡不能再呼叫 log_local，否則會把剛刪的 log 檔又建回來
+        print("AI File：本機資料已清除，重新開啟設定精靈")
+        fn = wizard_fn or run_setup_wizard
+        root = getattr(self.ui, "root", None)
+        res = fn(root)
+        self._resetting = False
+        if res.get("saved"):
+            new_cfg = res["config"]
+            self.config = new_cfg
+            self.allowed_folder = new_cfg.get("allowed_folder", "")
+            self.session_code = new_cfg.get("session_code", "")
+            self.relay = GitHubRelay(
+                new_cfg["pat"], new_cfg.get("relay_owner", RELAY_OWNER),
+                new_cfg.get("relay_repo", RELAY_REPO))
+            self.stopped = False
+            self._last_manifest_sig = None
+            self._seen_waiting = set()
+            self._pending_notice_sig = None
+            self.ui.set_code(self.session_code)
+            self.ui.set_status("監控中 — %s" % os.path.basename(
+                os.path.normpath(self.allowed_folder)))
+            self.send_heartbeat(force=True)
+            log_local("重設完成，已用新設定繼續監控")
+            return True
+        # 使用者關掉精靈沒存：沒有設定了，停在停止狀態
+        self.ui.set_status("已重設 — 尚未設定，請重新啟動 AI File")
+        self.ui.notify("AI File",
+                       "已清除資料，但沒有完成新的設定。\n"
+                       "請重新啟動 AI File 再設定一次。")
+        return False
 
     # -- 停止 ------------------------------------------------------
     def stop_from_local(self):
@@ -781,6 +1197,8 @@ class Agent:
     # -- 輪詢 ------------------------------------------------------
     def poll_once(self):
         """跑一輪：停止旗標 → 心跳 → 工作階段 → 重新生成 → 待同步。"""
+        if self._resetting:
+            return
         try:
             stop, _ = self.relay.get_json("stop.json")
         except Exception as e:
@@ -795,6 +1213,7 @@ class Agent:
                                "Muse 現在動不到你的檔案。" % stop.get("by", ""))
                 log_local("偵測到停止旗標（by=%s），停手" % stop.get("by", ""))
             self.send_heartbeat()
+            self._refresh_conn_status()
             return
         if self.stopped and not (isinstance(stop, dict)
                                  and stop.get("stopped")):
@@ -806,6 +1225,7 @@ class Agent:
         self._check_session()
         self._check_regen()
         self._check_pending()
+        self._refresh_conn_status()
         if not self.stopped:
             self.ui.set_status("監控中 — %s" % os.path.basename(
                 os.path.normpath(self.allowed_folder)))
@@ -837,6 +1257,10 @@ def run_setup_wizard(root, relay=None):
     ttk.Label(win, text="只授權私人 repo「ai-file-relay」的內容讀寫，"
               "在 GitHub 設定裡產生。",
               font=("Microsoft JhengHei", 9)).pack(anchor="w", padx=18)
+    ttk.Label(win, text="這組金鑰只設定一次，存在你的電腦，"
+              "絕對不要把這組給 AI；給 AI 的只有第 3 步的工作階段代碼。",
+              font=("Microsoft JhengHei", 9, "bold")).pack(
+                  anchor="w", padx=18)
     pat_var = tk.StringVar(value=cfg.get("pat", ""))
     ttk.Entry(win, textvariable=pat_var, show="*", width=60).pack(
         padx=18, pady=(2, 10), fill="x")
@@ -894,8 +1318,16 @@ def run_setup_wizard(root, relay=None):
                    "session_code": code,
                    "relay_owner": RELAY_OWNER, "relay_repo": RELAY_REPO}
         save_config(new_cfg)
-        # 把代碼雜湊寫進中繼，網頁版才能驗證 Muse 貼的代碼
+        # 存檔後立刻測一次連線，失敗就跳清楚的錯誤，不要只寫警告就繼續跑
         r = relay or GitHubRelay(pat)
+        ok, msg = test_connection(r)
+        if not ok:
+            mb.showerror("AI File：連線失敗",
+                         "設定已存在本機，但連不到中繼 repo：\n%s\n\n"
+                         "原因對照：\n%s" % (msg, CONNECTION_CAUSES),
+                         parent=win)
+            return
+        # 把代碼雜湊寫進中繼，網頁版才能驗證 Muse 貼的代碼
         try:
             r.put_json("session.json", {
                 "status": "none", "code_hash": code_hash(code),
@@ -918,6 +1350,16 @@ def run_setup_wizard(root, relay=None):
     ttk.Button(win, text="儲存並開始", command=save).pack(pady=16)
     root.wait_window(win)
     return result
+
+
+def _make_shortcut_once(cfg):
+    """第一次啟動時在背景建立桌面捷徑，成功才記下來，下次不再試。"""
+    if create_desktop_shortcut():
+        cfg["shortcut_created"] = True
+        try:
+            save_config(cfg)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- 主程式
@@ -953,6 +1395,22 @@ def main(argv):
     ui.set_code(agent.session_code)
     ui.set_status("監控中 — %s" % os.path.basename(
         os.path.normpath(agent.allowed_folder)))
+
+    # 第一次啟動：在背景建立桌面捷徑（失敗就靜默，只寫 log）
+    if not cfg.get("shortcut_created"):
+        threading.Thread(target=_make_shortcut_once, args=(cfg,),
+                         daemon=True).start()
+
+    # 啟動時自動更新：開始輪詢之前先檢查，有新版就更新、重啟
+    has_new, remote = check_for_update()
+    if has_new and perform_update(remote):
+        ui.set_status("正在更新到 v%s…" % remote)
+        log_local("正在更新到 v%s，完成後自動重開" % remote)
+        run_updater_and_exit()
+        root.after(2000, root.destroy)
+        root.mainloop()
+        return 0
+
     agent.send_heartbeat(force=True)
 
     if "--once" in argv:
@@ -966,7 +1424,8 @@ def main(argv):
 
     def tick():
         try:
-            agent.poll_once()
+            if not agent._resetting:
+                agent.poll_once()
         except Exception:
             traceback.print_exc()
             log_local("輪詢出錯（已略過，下一輪繼續）")
@@ -1006,6 +1465,13 @@ def run_core_check():
                        sha256_bytes(b"hello") ==
                        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e730"
                        "43362938b9824"))
+        checks.append(("版本比對：1.2 > 1.1",
+                       parse_version("1.2") > parse_version("1.1")))
+        checks.append(("版本比對：1.10 > 1.2",
+                       parse_version("1.10") > parse_version("1.2")))
+        checks.append(("版本比對：1.2 == 1.2",
+                       parse_version("1.2") == parse_version("1.2")))
+        checks.append(("VERSION 是 1.2", VERSION == "1.2"))
     except Exception as e:
         print("檢查出錯：%s" % e)
         return 1
