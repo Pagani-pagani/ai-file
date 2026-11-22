@@ -1,4 +1,4 @@
-/* AI File v1.3 — 網頁版
+/* AI File v1.5 — 網頁版
  * 靜態 SPA，跑在 GitHub Pages 上，沒有後端伺服器。
  * GitHub 金鑰只由管理員設定一次，存在瀏覽器 localStorage（aifile_pat）；
  * AI 登入只要工作階段代碼，不用再貼金鑰。
@@ -12,6 +12,15 @@
  *   編輯、刪除、重新命名都走 manifest 暫存，電腦按「同意」才套用。
  * - 管理員暫存的項目（by="admin"）不用等工作階段核准，但一樣要
  *   按「同意」才套用；重新命名走新的 action:"rename"。
+ * v1.5 改動：
+ * - 進入畫面加「目前狀態」獨立畫面（連線狀態只在那裡看）；登入畫面
+ *   加「← 返回」，純畫面切換不重新整理；AI 登入後登入卡片隱藏。
+ * - AI 介面也有檔案總管（唯讀瀏覽快照）＋「我暫存的檔案」。
+ * - 異動紀錄加開關（預設隱藏，狀態存 localStorage）。
+ * - 所有寫入都防版本衝突：409 就重新讀最新內容再重試（最多 3 次），
+ *   activity.json／manifest 的讀-改-寫不再互相蓋掉。
+ * - 效能：所有 fetch 加 10 秒逾時；等網路時只在按鈕／區塊顯示小提示，
+ *   沒有全螢幕載入畫面；定時器隨畫面開關，不重複建立。
  */
 "use strict";
 
@@ -25,6 +34,10 @@ var TEXT_EDIT_EXTS = ["txt", "md", "json", "js", "py", "html", "css", "csv", "lo
 var TEXT_EDIT_MAX_BYTES = 200 * 1024;
 var CONTENT_MAX_BYTES = 10 * 1024 * 1024;
 var EXPLORER_WAIT_MS = 30000;
+// 所有 GitHub API 請求的逾時（毫秒）：超過就報錯放開畫面，絕對不無限卡住
+var FETCH_TIMEOUT_MS = 10000;
+// 寫入衝突（409）重試次數：重新讀最新內容再寫，最多重試這麼多次
+var WRITE_RETRY_MAX = 3;
 
 var $ = function (id) { return document.getElementById(id); };
 function show(el) { el.classList.remove("hidden"); }
@@ -38,6 +51,23 @@ function notice(msg, type) {
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 function clearNotice() { hide($("notice")); }
+// 按鈕等網路時只顯示自己的忙碌狀態（按鈕變灰＋文字換成「…中」），
+// 畫面其他部分保持可操作，絕對不用全螢幕載入畫面擋住整個頁面。
+function setBtnBusy(btn, busy, busyText) {
+  if (!btn) return;
+  if (busy) {
+    if (!btn.dataset.origText) btn.dataset.origText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = busyText || "處理中…";
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.origText) { btn.textContent = btn.dataset.origText; delete btn.dataset.origText; }
+  }
+}
+// 活動紀錄沒存下來時的提醒文字（暫存本身成功，只是那筆紀錄要重看一次）
+function activityWarnSuffix(activityOk) {
+  return activityOk === false ? "（提醒：活動紀錄沒存下來，請重新整理頁面確認）" : "";
+}
 
 /* ---------- 編碼工具 ---------- */
 function utf8ToB64(str) {
@@ -78,6 +108,21 @@ function sha256Hex(input) {
 function utcnow() { return new Date().toISOString().replace(/\.\d+Z$/, "Z"); }
 
 /* ---------- GitHub API ---------- */
+// 帶逾時的 fetch：超過 FETCH_TIMEOUT_MS 沒回應就報錯，不讓畫面無限卡住
+function ghFetch(url, options) {
+  var opts = options || {};
+  if (typeof AbortController !== "undefined") {
+    var ctrl = new AbortController();
+    opts.signal = ctrl.signal;
+    setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, FETCH_TIMEOUT_MS);
+  }
+  return fetch(url, opts).catch(function (e) {
+    if (e && e.name === "AbortError") {
+      throw new Error("連線逾時（" + Math.round(FETCH_TIMEOUT_MS / 1000) + " 秒沒回應），請檢查網路或稍後再試");
+    }
+    throw e;
+  });
+}
 function ghHeaders(pat) {
   return {
     "Accept": "application/vnd.github+json",
@@ -93,11 +138,13 @@ function apiErrorReason(status) {
   if (status === 401) return "401：Token 不對或已過期，請重新產生 Token";
   if (status === 403) return "403：Token 權限不夠或沒有授權 ai-file-relay，請檢查 Token 設定";
   if (status === 404) return "404：找不到 repo 或 Token 看不到這個 repo，請檢查 repo 名稱與 Token 授權";
+  if (status === 409) return "409：檔案剛被另一邊改過（版本衝突），已自動重試";
+  if (status === 422) return "422：檔案剛被另一邊建立或內容不符，已自動重試";
   return "HTTP " + status;
 }
 // 讀一個檔案：回傳 {data, sha}；不存在回傳 {data: null, sha: null}
 function ghGetFile(pat, path) {
-  return fetch(API_BASE + "/" + ghPath(path), { headers: ghHeaders(pat) })
+  return ghFetch(API_BASE + "/" + ghPath(path), { headers: ghHeaders(pat) })
     .then(function (res) {
       if (res.status === 404) return { data: null, sha: null };
       if (!res.ok) throw new Error("讀取 " + path + " 失敗（" + apiErrorReason(res.status) + "）");
@@ -108,6 +155,7 @@ function ghGetFile(pat, path) {
     .catch(function (e) {
       // 我們自己丟的 HTTP 錯誤原樣往上丟；其他（例如連不上）才翻成中文
       if (e && e.message && e.message.indexOf("讀取 ") === 0) throw e;
+      if (e && e.message && e.message.indexOf("連線逾時") === 0) throw e;
       throw new Error("連不上 api.github.com，請檢查網路或防火牆");
     });
 }
@@ -118,44 +166,113 @@ function ghGetJson(pat, path) {
     catch (e) { throw new Error("檔案 " + path + " 不是正確的 JSON"); }
   });
 }
-// 寫一個檔案（文字或 base64 字串）：自動帶上現有 sha（更新用）
+// 用指定的 sha 寫一個檔案（PUT 一次）。409 會丟出帶 status=409 的錯誤，
+// 讓上層決定要不要用最新內容重試。
+function ghPutFileWithSha(pat, path, contentB64, message, sha) {
+  var body = { message: message, content: contentB64 };
+  if (sha) body.sha = sha;
+  return ghFetch(API_BASE + "/" + ghPath(path), {
+    method: "PUT", headers: ghHeaders(pat), body: JSON.stringify(body)
+  }).then(function (res) {
+    // 409（sha 不符）或 422（沒帶 sha 但檔案已存在）都是版本衝突：
+    // 丟出帶 status 的錯誤，讓上層用最新內容重試
+    if (res.status === 409 || res.status === 422) {
+      var conflict = new Error("寫入 " + path + " 失敗（版本衝突，檔案剛被另一邊改過）");
+      conflict.status = res.status;
+      throw conflict;
+    }
+    if (!res.ok) {
+      return res.json().catch(function () { return {}; }).then(function (j) {
+        var e2 = new Error("寫入 " + path + " 失敗（" + apiErrorReason(res.status) + "）" +
+          (j.message ? "：" + j.message : ""));
+        e2.status = res.status;
+        throw e2;
+      });
+    }
+    return res.json();
+  });
+}
+// 寫一個檔案（文字或 base64 字串）：自動帶上現有 sha（更新用）。
+// 內容不依賴舊內容的單純覆寫（session.json、stop.json、暫存檔等）：
+// 409 就用最新 sha 重試，最多 WRITE_RETRY_MAX 次。
 function ghPutFile(pat, path, contentB64, message) {
-  return ghGetFile(pat, path).then(function (cur) {
-    var body = { message: message, content: contentB64 };
-    if (cur.sha) body.sha = cur.sha;
-    return fetch(API_BASE + "/" + ghPath(path), {
-      method: "PUT", headers: ghHeaders(pat), body: JSON.stringify(body)
-    }).then(function (res) {
-      if (!res.ok) {
-        return res.json().catch(function () { return {}; }).then(function (j) {
-          throw new Error("寫入 " + path + " 失敗（" + apiErrorReason(res.status) + "）" +
-            (j.message ? "：" + j.message : ""));
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    return ghGetFile(pat, path).then(function (cur) {
+      return ghPutFileWithSha(pat, path, contentB64, message, cur.sha);
+    }).catch(function (e) {
+      if (e && (e.status === 409 || e.status === 422) && attempts < WRITE_RETRY_MAX) {
+        // 隨機等一下再重試：兩邊同時寫時才不會一直撞在同一個時間點
+        return new Promise(function (res) {
+          setTimeout(function () { res(attempt()); }, 100 + Math.random() * 200);
         });
       }
-      return res.json();
+      throw e;
     });
-  });
+  }
+  return attempt();
+}
+// 讀-改-寫（manifest、activity.json 這種「先讀出來、改好、寫回去」的檔案）：
+// 409 就重新讀最新內容、重新改一次再寫，最多 WRITE_RETRY_MAX 次。
+// mutate 收到目前的資料（檔案不存在就是 null），回傳要寫回去的新資料。
+function ghUpdateJson(pat, path, mutate, message) {
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    return ghGetJson(pat, path).then(function (r) {
+      var data = mutate(r.data);
+      return ghPutFileWithSha(pat, path, utf8ToB64(JSON.stringify(data, null, 2)), message, r.sha)
+        .then(function () { return data; });
+    }).catch(function (e) {
+      if (e && (e.status === 409 || e.status === 422) && attempts < WRITE_RETRY_MAX) {
+        return new Promise(function (res) {
+          setTimeout(function () { res(attempt()); }, 100 + Math.random() * 200);
+        });
+      }
+      throw e;
+    });
+  }
+  return attempt();
 }
 function ghPutJson(pat, path, obj, message) {
   return ghPutFile(pat, path, utf8ToB64(JSON.stringify(obj, null, 2)), message);
 }
 function ghDeleteFile(pat, path, message) {
-  return ghGetFile(pat, path).then(function (cur) {
-    if (!cur.sha) return;
-    return fetch(API_BASE + "/" + ghPath(path), {
-      method: "DELETE", headers: ghHeaders(pat),
-      body: JSON.stringify({ message: message, sha: cur.sha })
+  var attempts = 0;
+  function attempt() {
+    attempts++;
+    return ghGetFile(pat, path).then(function (cur) {
+      if (!cur.sha) return; // 已經不在了，算成功
+      return ghFetch(API_BASE + "/" + ghPath(path), {
+        method: "DELETE", headers: ghHeaders(pat),
+        body: JSON.stringify({ message: message, sha: cur.sha })
+      }).then(function (res) {
+        if (res.status === 404) return; // 刪的當下剛好被另一邊刪掉，算成功
+        if ((res.status === 409 || res.status === 422) && attempts < WRITE_RETRY_MAX) {
+          return new Promise(function (res2) {
+            setTimeout(function () { res2(attempt()); }, 100 + Math.random() * 200);
+          });
+        }
+        if (!res.ok) throw new Error("刪除 " + path + " 失敗（" + apiErrorReason(res.status) + "）");
+      });
     });
-  });
+  }
+  return attempt();
 }
+// 活動紀錄是讀-改-寫：本地端也會同時寫，409 就重讀最新內容再補一次。
+// 回傳 true（存好了）或 false（重試後還是失敗）；false 時呼叫端要明確告訴使用者。
 function appendActivity(pat, entry) {
-  return ghGetJson(pat, "activity.json").then(function (r) {
-    var list = Array.isArray(r.data) ? r.data : [];
+  return ghUpdateJson(pat, "activity.json", function (data) {
+    var list = Array.isArray(data) ? data : [];
     entry.at = entry.at || utcnow();
     list.push(entry);
-    return ghPutJson(pat, "activity.json", list, "AI File：新增活動紀錄");
+    return list;
+  }, "AI File：新增活動紀錄").then(function () {
+    return true;
   }).catch(function (e) {
-    console.warn("寫入活動紀錄失敗（不影響暫存本身）：", e);
+    console.warn("寫入活動紀錄失敗（已重試 " + WRITE_RETRY_MAX + " 次，不影響暫存本身）：", e);
+    return false;
   });
 }
 
@@ -184,7 +301,9 @@ var state = {
   ai: null,          // {name, code}：只在這次頁面登入後才有；重開頁面不自動還原
   sessionCode: "",   // 目前的工作階段代碼（從心跳讀來，管理員暫存時帶上）
   sessionPoll: null,
-  statusTimer: null
+  statusTimer: null,
+  statusViewOpen: false,  // 正在看「目前狀態」獨立畫面
+  activityFailed: false   // 最近一次活動紀錄沒存下來（重試後還是失敗）
 };
 
 // 金鑰只從管理員設定讀（localStorage aifile_pat），AI 登入不再帶金鑰
@@ -199,10 +318,10 @@ function savePat(p) {
   }
 }
 
-/* ---------- 連線狀態（登入後才開始每 30 秒讀 heartbeat.json） ---------- */
+/* ---------- 連線狀態（目前狀態畫面、登入後的定時刷新） ---------- */
 function refreshStatus() {
-  // 還沒登入就不顯示也不讀：登入前看不到連線狀態
-  if (!state.adminAuthed && !state.ai) return Promise.resolve();
+  // 還沒登入、也沒打開「目前狀態」畫面時就不讀：登入前看不到連線狀態
+  if (!state.adminAuthed && !state.ai && !state.statusViewOpen) return Promise.resolve();
   var p = pat();
   if (!p) {
     setStatus("grey", "尚未設定金鑰", "請管理員先在管理員介面設定 GitHub 金鑰（只需設定一次）。");
@@ -248,33 +367,59 @@ function startStatusTimer() {
   if (state.statusTimer) return;
   state.statusTimer = setInterval(function () {
     refreshStatus();
-    if (state.adminAuthed) { refreshPending(); refreshActivity(); refreshStopState(); }
+    if (state.adminAuthed) {
+      refreshPending();
+      if (activityVisible()) refreshActivity();
+      refreshStopState();
+    }
   }, 30000);
 }
 function stopStatusTimer() {
   if (state.statusTimer) { clearInterval(state.statusTimer); state.statusTimer = null; }
 }
-function showStatusCard() { show($("status-card")); }
+// 定時器只在「有人登入」或「正在看目前狀態」時才跑；回到主畫面／登出就停掉，
+// 不會越積越多。
+function updateTimers() {
+  if (state.adminAuthed || state.ai || state.statusViewOpen) startStatusTimer();
+  else stopStatusTimer();
+}
+
+/* ---------- 目前狀態（獨立畫面，連線狀態只在這裡看） ---------- */
+function showStatusView() {
+  hide($("landing")); hide($("admin-panel")); hide($("ai-panel"));
+  hide($("admin-auth")); hide($("ai-auth"));
+  clearNotice();
+  state.statusViewOpen = true;
+  show($("status-card"));
+  updateTimers();
+  refreshStatus();
+}
 
 /* ---------- 進入畫面 ---------- */
 function showLanding() {
+  state.statusViewOpen = false;
   show($("landing"));
   hide($("admin-panel")); hide($("ai-panel"));
   hide($("admin-auth")); hide($("ai-auth")); hide($("status-card"));
+  updateTimers();
+}
+function backToLanding() {
+  // 純畫面切換：只換顯示的區塊，不重新整理頁面、不重抓資料
+  showLanding();
 }
 function enterAi() {
-  hide($("landing")); hide($("admin-auth")); hide($("admin-panel"));
+  hide($("landing")); hide($("admin-auth")); hide($("admin-panel")); hide($("status-card"));
   clearNotice();
   if (state.ai) {
     show($("ai-panel"));
     $("ai-session-state").textContent = "工作階段狀態：已登入（" + state.ai.name + "）";
-    refreshMyStaged(); pollSession();
+    refreshMyStaged(); refreshExplorer(false); pollSession();
   } else {
     show($("ai-auth"));
   }
 }
 function enterAdmin() {
-  hide($("landing")); hide($("ai-auth")); hide($("ai-panel"));
+  hide($("landing")); hide($("ai-auth")); hide($("ai-panel")); hide($("status-card"));
   clearNotice();
   if (state.adminAuthed) {
     show($("admin-panel")); loadAdminData();
@@ -378,6 +523,7 @@ function testConnection() {
     $("conn-test-result").textContent = "還沒設定 GitHub 金鑰，請管理員先在上方設定（只需設定一次）。";
     return;
   }
+  setBtnBusy($("btn-test-conn"), true, "測試中…");
   $("conn-test-result").textContent = "測試中…";
   ghGetJson(p, "heartbeat.json").then(function (r) {
     if (!r.data || !r.data.updated_at) {
@@ -389,19 +535,36 @@ function testConnection() {
   }).catch(function (e) {
     $("conn-test-result").textContent = "連線失敗：" + String(e.message || e);
     refreshStatus();
+  }).then(function () {
+    setBtnBusy($("btn-test-conn"), false);
   });
+}
+
+/* ---------- 異動紀錄開關（預設隱藏，狀態存這個瀏覽器） ---------- */
+function activityVisible() {
+  try { return localStorage.getItem("aifile_show_activity") === "1"; }
+  catch (e) { return false; }
+}
+function setActivityVisible(on) {
+  try { localStorage.setItem("aifile_show_activity", on ? "1" : "0"); }
+  catch (e) { /* 存不下來也沒關係，下次預設隱藏 */ }
+  var body = $("activity-body");
+  if (on) show(body); else hide(body);
+  var toggle = $("toggle-activity");
+  if (toggle) toggle.checked = !!on;
+  if (on) refreshActivity();
 }
 
 /* ---------- 管理員介面 ---------- */
 function loadAdminData() {
-  showStatusCard();
+  // 連線狀態不在這裡顯示：只在獨立的「目前狀態」畫面看
   updatePatState();
   refreshStatus();
   refreshPending();
-  refreshActivity();
+  setActivityVisible(activityVisible());
   refreshStopState();
   refreshExplorer(true);
-  startStatusTimer();
+  updateTimers();
 }
 function refreshStopState() {
   var p = pat();
@@ -433,9 +596,8 @@ function cancelStaged(key, isAdmin) {
   ghGetJson(p, "pending/manifest.json").then(function (r) {
     var files = (r.data && r.data.files) || [];
     var target = null;
-    var rest = files.filter(function (f) {
-      if (entryKey(f) === key) { target = f; return false; }
-      return true;
+    files.forEach(function (f) {
+      if (entryKey(f) === key) target = f;
     });
     if (!target) throw new Error("這筆暫存已經不在清單裡（可能已經同步或被取消了）。");
     if (!isAdmin && (!state.ai || target.ai_name !== state.ai.name)) {
@@ -445,7 +607,10 @@ function cancelStaged(key, isAdmin) {
       ? ghDeleteFile(p, "pending/" + target.file, "AI File：取消暫存，刪除暫存檔")
       : Promise.resolve();
     return delBlob.then(function () {
-      return ghPutJson(p, "pending/manifest.json", { files: rest }, "AI File：取消一筆暫存");
+      return ghUpdateJson(p, "pending/manifest.json", function (data) {
+        var list = (data && data.files) || [];
+        return { files: list.filter(function (f) { return entryKey(f) !== key; }) };
+      }, "AI File：取消一筆暫存");
     }).then(function () {
       return appendActivity(p, {
         action: "cancelled-staged",
@@ -454,8 +619,8 @@ function cancelStaged(key, isAdmin) {
         detail: "已取消暫存"
       });
     });
-  }).then(function () {
-    notice("已取消暫存。", "ok");
+  }).then(function (activityOk) {
+    notice("已取消暫存。" + activityWarnSuffix(activityOk), activityOk === false ? "info" : "ok");
     refreshMyStaged();
     if (state.adminAuthed) refreshPending();
   }).catch(function (e) { notice(String(e.message || e), "err"); });
@@ -570,8 +735,8 @@ function requestUndo(batchId) {
         batch_id: batchId, detail: "管理員在網頁版要求返回這批同步"
       });
     })
-    .then(function () {
-      notice("已送出返回要求，等本地端確認。", "ok");
+    .then(function (activityOk) {
+      notice("已送出返回要求，等本地端確認。" + activityWarnSuffix(activityOk), activityOk === false ? "info" : "ok");
       refreshActivity();
     })
     .catch(function (e) { notice(String(e.message || e), "err"); });
@@ -582,8 +747,10 @@ function regenCode() {
   if (!confirm("確定要重新生成工作階段代碼嗎？舊代碼會立刻失效，尚未同步的暫存也會被拒收。")) return;
   ghPutJson(p, "regen.json", { requested: true, at: utcnow(), by: "web" }, "AI File：請求重新生成代碼")
     .then(function () {
-      notice("已送出重新生成請求。新的代碼會顯示在你電腦的 AI File 視窗上，網頁這裡也會在下次心跳時更新。", "ok");
-      appendActivity(p, { action: "code-regenerated", ai_name: "", detail: "管理員在網頁版請求重新生成代碼" });
+      return appendActivity(p, { action: "code-regenerated", ai_name: "", detail: "管理員在網頁版請求重新生成代碼" });
+    })
+    .then(function (activityOk) {
+      notice("已送出重新生成請求。新的代碼會顯示在你電腦的 AI File 視窗上，網頁這裡也會在下次心跳時更新。" + activityWarnSuffix(activityOk), activityOk === false ? "info" : "ok");
     })
     .catch(function (e) { notice(String(e.message || e), "err"); });
 }
@@ -592,8 +759,10 @@ function setStopped(stopped) {
   if (!p) return notice("請先在管理員介面設定 GitHub 金鑰（只需設定一次）。", "err");
   ghPutJson(p, "stop.json", { stopped: stopped, by: "web", at: utcnow() }, stopped ? "AI File：網頁版按下停止" : "AI File：網頁版按下恢復")
     .then(function () {
-      appendActivity(p, { action: stopped ? "stopped" : "resumed", ai_name: "", detail: stopped ? "管理員在網頁版按下停止" : "管理員在網頁版按下恢復" });
-      notice(stopped ? "已停止。AI 現在動不到你的檔案。" : "已恢復監控。", "ok");
+      return appendActivity(p, { action: stopped ? "stopped" : "resumed", ai_name: "", detail: stopped ? "管理員在網頁版按下停止" : "管理員在網頁版按下恢復" });
+    })
+    .then(function (activityOk) {
+      notice((stopped ? "已停止。AI 現在動不到你的檔案。" : "已恢復監控。") + activityWarnSuffix(activityOk), activityOk === false ? "info" : "ok");
       refreshStopState(); refreshStatus();
     })
     .catch(function (e) { notice(String(e.message || e), "err"); });
@@ -609,12 +778,22 @@ function setStopped(stopped) {
  * 在同步確認窗按「同意」本身就是授權），但停止旗標開啟時一樣拒絕。
  */
 var explorer = {
-  snapshot: null,    // snapshot.json 的內容
+  snapshot: null,    // snapshot.json 的內容（管理員和 AI 共用同一份）
   online: false,     // 心跳新鮮（90 秒內）
   currentPath: "",   // 目前資料夾（相對路徑，根目錄是 ""）
   search: "",
   multiselect: false,
-  selected: {}       // rel_path -> true
+  selected: {},      // rel_path -> true
+  prefix: "explorer",
+  readonly: false,
+  waitGen: 0         // 登出／切換時加 1，進行中的等待會自己停下來
+};
+// AI 檔案總管：唯讀瀏覽同一份快照（自己的 currentPath／search，和管理員分開）
+var aiExplorer = {
+  currentPath: "",
+  search: "",
+  prefix: "ai-explorer",
+  readonly: true
 };
 
 /* 純函式（方便單元測試）：大小、時間、篩選、排序 */
@@ -678,19 +857,26 @@ function isHeartbeatFresh(hb) {
 }
 
 /* 載入快照：電腦在線且要求即時時，先寫 list_request.json 等新快照 */
-function refreshExplorer(requestFresh) {
+function refreshExplorer(requestFresh, by) {
   var p = pat();
-  if (!p || !state.adminAuthed) return Promise.resolve();
+  if (!p || (!state.adminAuthed && !state.ai)) return Promise.resolve();
+  if (requestFresh) {
+    setBtnBusy($("btn-explorer-refresh"), true, "重新整理中…");
+    setBtnBusy($("btn-ai-explorer-refresh"), true, "重新整理中…");
+  }
   return ghGetJson(p, "heartbeat.json").then(function (r) {
     explorer.online = isHeartbeatFresh(r.data);
     if (r.data && r.data.session_code) state.sessionCode = r.data.session_code;
     if (explorer.online && requestFresh) {
-      return requestFreshSnapshot().then(function () { return loadSnapshot(); });
+      return requestFreshSnapshot(by).then(function () { return loadSnapshot(); });
     }
     return loadSnapshot();
   }).catch(function () {
     explorer.online = false;
     return loadSnapshot();
+  }).then(function () {
+    setBtnBusy($("btn-explorer-refresh"), false);
+    setBtnBusy($("btn-ai-explorer-refresh"), false);
   });
 }
 function loadSnapshot() {
@@ -698,29 +884,40 @@ function loadSnapshot() {
   return ghGetJson(p, "snapshot.json").then(function (r) {
     explorer.snapshot = r.data || null;
     renderExplorer();
+    if (state.ai) renderAiExplorer();
   }).catch(function () {
     explorer.snapshot = null;
     renderExplorer();
+    if (state.ai) renderAiExplorer();
   });
 }
-function requestFreshSnapshot() {
+function requestFreshSnapshot(by) {
   var p = pat();
+  var gen = explorer.waitGen;
   var requestId = "lr-" + Date.now().toString(36) + "-" +
     Math.random().toString(36).slice(2, 8);
   var requestedAt = utcnow();
+  // 區塊內的小提示：只改徽章文字，不鎖畫面，其他部分照常用
+  var badge = $("explorer-status");
+  if (badge) badge.textContent = "重新整理中…";
+  var aiBadge = $("ai-explorer-status");
+  if (aiBadge) aiBadge.textContent = "重新整理中…";
   return ghPutJson(p, "list_request.json",
-    { request_id: requestId, requested_at: requestedAt, by: "admin" },
+    { request_id: requestId, requested_at: requestedAt, by: by || "admin" },
     "AI File：要求重新整理快照").then(function () {
-      // 等 snapshot.json 的 generated_at 比要求時間新，最多等 30 秒
+      // 背景等 snapshot.json 的 generated_at 比要求時間新，最多等 30 秒；
+      // 等的時候畫面完全可以繼續操作，登出或切換畫面就自己停下來
       var start = Date.now();
       return new Promise(function (resolve) {
         function poll() {
+          if (gen !== explorer.waitGen) return resolve(false);
           ghGetJson(p, "snapshot.json").then(function (r) {
             if (r.data && r.data.generated_at &&
                 r.data.generated_at >= requestedAt) return resolve(true);
             if (Date.now() - start > EXPLORER_WAIT_MS) return resolve(false);
             setTimeout(poll, 2000);
           }).catch(function () {
+            if (gen !== explorer.waitGen) return resolve(false);
             if (Date.now() - start > EXPLORER_WAIT_MS) return resolve(false);
             setTimeout(poll, 2000);
           });
@@ -728,22 +925,27 @@ function requestFreshSnapshot() {
         poll();
       });
     }).then(function (ok) {
-      if (!ok) notice("電腦沒回應，可能沒開。先顯示上次的快照。", "err");
+      if (!ok && gen === explorer.waitGen) notice("電腦沒回應，可能沒開。先顯示上次的快照。", "err");
       return ok;
     });
 }
 
-/* 渲染：麵包屑、列表、搜尋、狀態徽章 */
-function renderExplorer() {
-  var badge = $("explorer-status");
-  var count = $("explorer-count");
-  var crumbs = $("explorer-crumbs");
-  var tbody = $("explorer-list");
+/* 渲染：麵包屑、列表、搜尋、狀態徽章。
+ * 管理員檔案總管和 AI 檔案總管共用同一套渲染：view 帶 prefix（元素 id 前綴）、
+ * readonly（AI 的是唯讀瀏覽，沒有勾選框和「⋯」操作）、currentPath、search。
+ * 快照本身兩邊共用同一份 explorer.snapshot（本地端產生的最新快照）。
+ */
+function renderExplorerView(view) {
+  var badge = $(view.prefix + "-status");
+  var count = $(view.prefix + "-count");
+  var crumbs = $(view.prefix + "-crumbs");
+  var tbody = $(view.prefix + "-list");
+  var cols = view.readonly ? 5 : 7;
   if (!explorer.snapshot) {
     badge.textContent = "尚未載入";
     count.textContent = "";
     crumbs.innerHTML = "";
-    tbody.innerHTML = "<tr><td colspan='7' class='hint'>還沒有快照。請確認電腦上的 AI File 已經啟動過一次。</td></tr>";
+    tbody.innerHTML = "<tr><td colspan='" + cols + "' class='hint'>還沒有快照。請確認電腦上的 AI File 已經啟動過一次。</td></tr>";
     return;
   }
   badge.textContent = explorerBadgeText();
@@ -760,13 +962,13 @@ function renderExplorer() {
   root.textContent = explorer.snapshot.folder_name || "全部檔案";
   root.addEventListener("click", function (e) {
     e.preventDefault();
-    explorer.currentPath = ""; explorer.search = "";
-    $("explorer-search").value = "";
-    renderExplorer();
+    view.currentPath = ""; view.search = "";
+    $(view.prefix + "-search").value = "";
+    renderExplorerView(view);
   });
   crumbs.appendChild(root);
-  if (explorer.currentPath) {
-    var parts = explorer.currentPath.split("/");
+  if (view.currentPath) {
+    var parts = view.currentPath.split("/");
     var acc = "";
     parts.forEach(function (seg) {
       crumbs.appendChild(document.createTextNode(" / "));
@@ -776,8 +978,8 @@ function renderExplorer() {
         a.href = "#"; a.textContent = seg;
         a.addEventListener("click", function (e) {
           e.preventDefault();
-          explorer.currentPath = p;
-          renderExplorer();
+          view.currentPath = p;
+          renderExplorerView(view);
         });
         crumbs.appendChild(a);
       })(acc);
@@ -786,40 +988,44 @@ function renderExplorer() {
   // 列表
   tbody.innerHTML = "";
   var rows;
-  var searching = !!explorer.search.trim();
+  var searching = !!view.search.trim();
   if (searching) {
-    rows = explorerSort(explorerSearch(explorer.snapshot, explorer.search.trim()));
+    rows = explorerSort(explorerSearch(explorer.snapshot, view.search.trim()));
     if (!rows.length) {
-      tbody.innerHTML = "<tr><td colspan='7' class='hint'>沒有符合的檔案</td></tr>";
+      tbody.innerHTML = "<tr><td colspan='" + cols + "' class='hint'>沒有符合的檔案</td></tr>";
       return;
     }
     count.textContent = "找到 " + rows.length + " 個符合的檔案";
   } else {
-    rows = explorerSort(explorerChildren(explorer.snapshot, explorer.currentPath));
+    rows = explorerSort(explorerChildren(explorer.snapshot, view.currentPath));
     if (!rows.length) {
-      tbody.innerHTML = "<tr><td colspan='7' class='hint'>這個資料夾是空的</td></tr>";
+      tbody.innerHTML = "<tr><td colspan='" + cols + "' class='hint'>這個資料夾是空的</td></tr>";
       return;
     }
   }
-  rows.forEach(function (e) { tbody.appendChild(explorerRow(e, searching)); });
-  updateSelectionBar();
+  rows.forEach(function (e) { tbody.appendChild(explorerRow(e, searching, view)); });
+  if (!view.readonly) updateSelectionBar();
 }
-function explorerRow(e, searching) {
+function renderExplorer() { renderExplorerView(explorer); }
+function renderAiExplorer() { renderExplorerView(aiExplorer); }
+function explorerRow(e, searching, view) {
   var tr = document.createElement("tr");
   tr.className = "explorer-row";
-  var tdCheck = document.createElement("td");
-  if (explorer.multiselect) {
-    var cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = !!explorer.selected[e.path];
-    cb.addEventListener("change", function () {
-      if (cb.checked) explorer.selected[e.path] = true;
-      else delete explorer.selected[e.path];
-      updateSelectionBar();
-    });
-    tdCheck.appendChild(cb);
+  if (!view.readonly) {
+    var tdCheck = document.createElement("td");
+    if (explorer.multiselect) {
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !!explorer.selected[e.path];
+      cb.addEventListener("change", function () {
+        if (cb.checked) explorer.selected[e.path] = true;
+        else delete explorer.selected[e.path];
+        updateSelectionBar();
+      });
+      tdCheck.appendChild(cb);
+    }
+    tr.appendChild(tdCheck);
   }
-  tr.appendChild(tdCheck);
   var name = e.path.split("/").pop();
   var tdName = document.createElement("td");
   tdName.className = "explorer-name";
@@ -832,21 +1038,23 @@ function explorerRow(e, searching) {
     tdName.appendChild(meta);
   }
   tdName.addEventListener("click", function () {
-    if (explorer.multiselect) {
+    if (!view.readonly && explorer.multiselect) {
       toggleSelect(e.path);
       renderExplorer();
       return;
     }
     if (e.is_dir) {
-      explorer.currentPath = e.path;
-      explorer.search = "";
-      $("explorer-search").value = "";
-      renderExplorer();
+      view.currentPath = e.path;
+      view.search = "";
+      $(view.prefix + "-search").value = "";
+      renderExplorerView(view);
     }
   });
-  tdName.addEventListener("dblclick", function () {
-    if (!explorer.multiselect) openExplorerAction(e);
-  });
+  if (!view.readonly) {
+    tdName.addEventListener("dblclick", function () {
+      if (!explorer.multiselect) openExplorerAction(e);
+    });
+  }
   tr.appendChild(tdName);
   var tdExt = document.createElement("td");
   tdExt.textContent = e.is_dir ? "—" : (e.ext || "—");
@@ -860,13 +1068,15 @@ function explorerRow(e, searching) {
   var tdKind = document.createElement("td");
   tdKind.textContent = e.kind || "—";
   tr.appendChild(tdKind);
-  var tdMore = document.createElement("td");
-  var btn = document.createElement("button");
-  btn.className = "btn btn-outline btn-small";
-  btn.textContent = "⋯";
-  btn.addEventListener("click", function () { openExplorerAction(e); });
-  tdMore.appendChild(btn);
-  tr.appendChild(tdMore);
+  if (!view.readonly) {
+    var tdMore = document.createElement("td");
+    var btn = document.createElement("button");
+    btn.className = "btn btn-outline btn-small";
+    btn.textContent = "⋯";
+    btn.addEventListener("click", function () { openExplorerAction(e); });
+    tdMore.appendChild(btn);
+    tr.appendChild(tdMore);
+  }
   return tr;
 }
 
@@ -984,11 +1194,12 @@ function stageAdminEntryNow(entry, fileB64) {
     ? ghPutFile(p, "pending/" + entry.file, fileB64, "AI File：管理員暫存 " + entry.rel_path)
     : Promise.resolve();
   return putFile.then(function () {
-    return ghGetJson(p, "pending/manifest.json");
-  }).then(function (r) {
-    var manifest = (r.data && Array.isArray(r.data.files)) ? r.data : { files: [] };
-    manifest.files.push(entry);
-    return ghPutJson(p, "pending/manifest.json", manifest, "AI File：更新待同步清單");
+    // manifest 也是讀-改-寫：用 ghUpdateJson，兩邊同時暫存也不會互相蓋掉
+    return ghUpdateJson(p, "pending/manifest.json", function (data) {
+      var manifest = (data && Array.isArray(data.files)) ? data : { files: [] };
+      manifest.files.push(entry);
+      return manifest;
+    }, "AI File：更新待同步清單");
   }).then(function () {
     return appendActivity(p, {
       action: entry.action, ai_name: "管理員",
@@ -1038,8 +1249,9 @@ function stageAdminFiles(fileList, dirPath) {
       }));
     });
     return Promise.all(jobs);
-  }).then(function () {
-    notice("已暫存 " + fileList.length + " 個檔案到「" + (dirPath || "根目錄") + "」。電腦開著會跳出確認，等你按「同意」才會寫入；電腦沒開就先等著。", "ok");
+  }).then(function (results) {
+    var activityOk = (results || []).every(function (r) { return r !== false; });
+    notice("已暫存 " + fileList.length + " 個檔案到「" + (dirPath || "根目錄") + "」。電腦開著會跳出確認，等你按「同意」才會寫入；電腦沒開就先等著。" + activityWarnSuffix(activityOk), activityOk ? "ok" : "info");
     $("explorer-file-input").value = "";
     refreshPending();
   }).catch(function (e) { notice(String(e.message || e), "err"); });
@@ -1048,6 +1260,7 @@ function stageAdminFiles(fileList, dirPath) {
 /* 下載／編輯：向電腦索取檔案內容（content_request / content_response） */
 function requestFileContent(rel) {
   var p = pat();
+  var gen = explorer.waitGen;
   var requestId = "cr-" + Date.now().toString(36) + "-" +
     Math.random().toString(36).slice(2, 8);
   return ghPutJson(p, "content_request.json",
@@ -1056,11 +1269,14 @@ function requestFileContent(rel) {
       var start = Date.now();
       return new Promise(function (resolve) {
         function poll() {
+          // 登出或切換畫面就自己停下來；等待時畫面完全可以繼續操作
+          if (gen !== explorer.waitGen) return resolve(null);
           ghGetJson(p, "content_response.json").then(function (r) {
             if (r.data && r.data.request_id === requestId) return resolve(r.data);
             if (Date.now() - start > EXPLORER_WAIT_MS) return resolve(null);
             setTimeout(poll, 2000);
           }).catch(function () {
+            if (gen !== explorer.waitGen) return resolve(null);
             if (Date.now() - start > EXPLORER_WAIT_MS) return resolve(null);
             setTimeout(poll, 2000);
           });
@@ -1134,8 +1350,8 @@ function saveExplorerEdit(rel, text) {
       });
       return stageAdminEntry(entry, bytesToB64(bytes));
     });
-  }).then(function () {
-    notice("已暫存修改：" + rel + "。電腦上按「同意」後才會覆蓋。", "ok");
+  }).then(function (activityOk) {
+    notice("已暫存修改：" + rel + "。電腦上按「同意」後才會覆蓋。" + activityWarnSuffix(activityOk), activityOk === false ? "info" : "ok");
     refreshPending();
   }).catch(function (e) { notice(String(e.message || e), "err"); });
 }
@@ -1157,8 +1373,9 @@ function confirmDeleteEntries(entries) {
       return stageAdminEntry(entry, null);
     });
     return Promise.all(jobs);
-  }).then(function () {
-    notice("已暫存 " + entries.length + " 筆刪除要求，電腦上按「同意」後才會真的刪除。", "ok");
+  }).then(function (results) {
+    var activityOk = (results || []).every(function (r) { return r !== false; });
+    notice("已暫存 " + entries.length + " 筆刪除要求，電腦上按「同意」後才會真的刪除。" + activityWarnSuffix(activityOk), activityOk ? "ok" : "info");
     refreshPending();
     setMultiselect(false);
   }).catch(function (e) { notice(String(e.message || e), "err"); });
@@ -1217,8 +1434,9 @@ function stageRenames(renames) {
       return stageAdminEntry(entry, null);
     });
     return Promise.all(jobs);
-  }).then(function () {
-    notice("已暫存 " + renames.length + " 筆重新命名，電腦上按「同意」後才會真的改名。", "ok");
+  }).then(function (results) {
+    var activityOk = (results || []).every(function (r) { return r !== false; });
+    notice("已暫存 " + renames.length + " 筆重新命名，電腦上按「同意」後才會真的改名。" + activityWarnSuffix(activityOk), activityOk ? "ok" : "info");
     refreshPending();
     setMultiselect(false);
   }).catch(function (e) { notice(String(e.message || e), "err"); });
@@ -1232,6 +1450,7 @@ function aiLogin() {
   if (!code) return notice("請輸入工作階段代碼。", "err");
   var p = pat();
   if (!p) return notice("這個瀏覽器還沒設定 GitHub 金鑰，請管理員先在上方設定（只需設定一次）；或直接把工作階段代碼在對話裡給 Muse，Muse 會用自己的連線處理。", "err");
+  setBtnBusy($("btn-login-ai"), true, "送出中…");
   ghGetJson(p, "session.json").then(function (r) {
     if (!r.data || !r.data.code_hash) {
       throw new Error("本地端尚未產生工作階段代碼，請先在 Windows 電腦上完成 AI File 的第一次設定。");
@@ -1251,10 +1470,17 @@ function aiLogin() {
       // 只存名稱和代碼，下次開頁面只預填欄位，絕對不自動還原登入
       localStorage.setItem("aifile_ai", JSON.stringify(state.ai));
     } catch (e) { /* 存不下來也沒關係，下次再填一次就好 */ }
+    // 登入成功就只顯示 AI 介面：登入卡片整個隱藏，不用再看到登入小視窗
+    hide($("ai-auth")); hide($("landing"));
+    show($("ai-panel"));
     notice("已送出連線請求，請等使用者在他的電腦上按「是」。", "info");
     $("ai-session-state").textContent = "工作階段狀態：等待使用者按「是」…";
+    refreshMyStaged();
+    refreshExplorer(false);
+    updateTimers();
     pollSession();
-  }).catch(function (e) { notice(String(e.message || e), "err"); });
+  }).catch(function (e) { notice(String(e.message || e), "err"); })
+  .then(function () { setBtnBusy($("btn-login-ai"), false); });
 }
 function pollSession() {
   if (state.sessionPoll) clearInterval(state.sessionPoll);
@@ -1266,8 +1492,7 @@ function pollSession() {
         clearInterval(state.sessionPoll);
         $("ai-session-state").textContent = "工作階段狀態：已允許，可以開始暫存檔案。";
         show($("ai-panel"));
-        showStatusCard();
-        startStatusTimer();
+        updateTimers();
         refreshStatus();
         notice("使用者已按「是」，可以開始暫存檔案了。", "ok");
       } else if (s.status === "stopped") {
@@ -1333,11 +1558,12 @@ function stageEntryNow(entry, fileB64) {
     ? ghPutFile(p, "pending/" + entry.file, fileB64, "AI File：" + state.ai.name + " 暫存 " + entry.rel_path)
     : Promise.resolve();
   return putFile.then(function () {
-    return ghGetJson(p, "pending/manifest.json");
-  }).then(function (r) {
-    var manifest = (r.data && Array.isArray(r.data.files)) ? r.data : { files: [] };
-    manifest.files.push(entry);
-    return ghPutJson(p, "pending/manifest.json", manifest, "AI File：更新待同步清單");
+    // manifest 也是讀-改-寫：用 ghUpdateJson，兩邊同時暫存也不會互相蓋掉
+    return ghUpdateJson(p, "pending/manifest.json", function (data) {
+      var manifest = (data && Array.isArray(data.files)) ? data : { files: [] };
+      manifest.files.push(entry);
+      return manifest;
+    }, "AI File：更新待同步清單");
   }).then(function () {
     return appendActivity(p, {
       action: entry.action, ai_name: state.ai.name,
@@ -1348,6 +1574,7 @@ function stageEntryNow(entry, fileB64) {
 function stageFiles(fileList, relPathHint) {
   if (!state.ai) return notice("請先完成 AI 登入。", "err");
   if (!fileList || !fileList.length) return notice("請先選擇要上傳的檔案。", "err");
+  setBtnBusy($("btn-stage-file"), true, "暫存中…");
   checkStagingReady().then(function () {
     var jobs = [];
     Array.from(fileList).forEach(function (file, i) {
@@ -1383,12 +1610,14 @@ function stageFiles(fileList, relPathHint) {
       }));
     });
     return Promise.all(jobs);
-  }).then(function () {
-    notice("已暫存 " + fileList.length + " 個檔案，使用者在電腦上按「同意」後才會寫入。", "ok");
+  }).then(function (results) {
+    var activityOk = (results || []).every(function (r) { return r !== false; });
+    notice("已暫存 " + fileList.length + " 個檔案，使用者在電腦上按「同意」後才會寫入。" + activityWarnSuffix(activityOk), activityOk ? "ok" : "info");
     $("file-input").value = "";
     refreshMyStaged();
     if (state.adminAuthed) refreshPending();
-  }).catch(function (e) { notice(String(e.message || e), "err"); });
+  }).catch(function (e) { notice(String(e.message || e), "err"); })
+  .then(function () { setBtnBusy($("btn-stage-file"), false); });
 }
 function stagePaste() {
   if (!state.ai) return notice("請先完成 AI 登入。", "err");
@@ -1398,6 +1627,7 @@ function stagePaste() {
   try { rel = sanitizeRelPath(name); }
   catch (e) { return notice(String(e.message || e), "err"); }
   if (!content) return notice("請先貼上檔案內容。", "err");
+  setBtnBusy($("btn-stage-paste"), true, "暫存中…");
   checkStagingReady().then(function () {
     var bytes = new TextEncoder().encode(content);
     return sha256Hex(bytes).then(function (hash) {
@@ -1414,12 +1644,13 @@ function stagePaste() {
       };
       return stageEntry(entry, bytesToB64(bytes));
     });
-  }).then(function () {
-    notice("已暫存 " + rel + "，使用者在電腦上按「同意」後才會寫入。", "ok");
+  }).then(function (activityOk) {
+    notice("已暫存 " + rel + "，使用者在電腦上按「同意」後才會寫入。" + activityWarnSuffix(activityOk), activityOk === false ? "info" : "ok");
     $("paste-name").value = ""; $("paste-content").value = "";
     refreshMyStaged();
     if (state.adminAuthed) refreshPending();
-  }).catch(function (e) { notice(String(e.message || e), "err"); });
+  }).catch(function (e) { notice(String(e.message || e), "err"); })
+  .then(function () { setBtnBusy($("btn-stage-paste"), false); });
 }
 function stageDelete() {
   if (!state.ai) return notice("請先完成 AI 登入。", "err");
@@ -1427,6 +1658,7 @@ function stageDelete() {
   try { rel = sanitizeRelPath($("delete-path").value.trim()); }
   catch (e) { return notice(String(e.message || e), "err"); }
   if (!confirm("確定要請使用者刪除「" + rel + "」嗎？使用者在電腦上按「同意」後才會真的刪除。")) return;
+  setBtnBusy($("btn-stage-delete"), true, "暫存中…");
   checkStagingReady().then(function () {
     var entry = {
       id: newStageId(),
@@ -1434,12 +1666,13 @@ function stageDelete() {
       ai_name: state.ai.name, time: utcnow(), session_code: state.ai.code
     };
     return stageEntry(entry, null);
-  }).then(function () {
-    notice("已暫存刪除要求：" + rel + "。", "ok");
+  }).then(function (activityOk) {
+    notice("已暫存刪除要求：" + rel + "。" + activityWarnSuffix(activityOk), activityOk === false ? "info" : "ok");
     $("delete-path").value = "";
     refreshMyStaged();
     if (state.adminAuthed) refreshPending();
-  }).catch(function (e) { notice(String(e.message || e), "err"); });
+  }).catch(function (e) { notice(String(e.message || e), "err"); })
+  .then(function () { setBtnBusy($("btn-stage-delete"), false); });
 }
 function refreshMyStaged() {
   if (!state.ai) return;
@@ -1476,6 +1709,11 @@ $("btn-enter-admin").addEventListener("click", enterAdmin);
 $("btn-help").addEventListener("click", openHelp);
 $("help-close").addEventListener("click", closeHelp);
 $("help-backdrop").addEventListener("click", closeHelp);
+$("btn-status-view").addEventListener("click", showStatusView);
+$("btn-back-status").addEventListener("click", backToLanding);
+// 返回按鈕：純畫面切換，不重新整理、不重抓資料
+$("btn-back-ai").addEventListener("click", backToLanding);
+$("btn-back-admin").addEventListener("click", backToLanding);
 document.addEventListener("keydown", function (e) {
   if (e.key === "Escape") { closeHelp(); closeExplorerModal(); }
 });
@@ -1484,8 +1722,11 @@ $("btn-logout").addEventListener("click", function () {
   try { localStorage.removeItem("aifile_ai"); } catch (e) {}
   if (state.sessionPoll) { clearInterval(state.sessionPoll); state.sessionPoll = null; }
   stopStatusTimer();
+  // 世代加 1：進行中的檔案總管等待（快照／檔案內容）會自己停下來
+  explorer.waitGen++;
   explorer.snapshot = null; explorer.currentPath = ""; explorer.search = "";
   explorer.multiselect = false; explorer.selected = {}; explorer.online = false;
+  aiExplorer.currentPath = ""; aiExplorer.search = "";
   showLanding();
   $("ai-name").value = "";
   $("ai-code").value = "";
@@ -1501,17 +1742,27 @@ $("btn-regen").addEventListener("click", regenCode);
 $("btn-stop").addEventListener("click", function () { setStopped(true); });
 $("btn-resume").addEventListener("click", function () { setStopped(false); });
 $("btn-refresh-activity").addEventListener("click", refreshActivity);
+$("toggle-activity").addEventListener("change", function () {
+  setActivityVisible($("toggle-activity").checked);
+});
 $("btn-login-ai").addEventListener("click", aiLogin);
 $("btn-stage-file").addEventListener("click", function () {
   stageFiles($("file-input").files, $("rel-path").value.trim());
 });
 $("btn-stage-paste").addEventListener("click", stagePaste);
 $("btn-stage-delete").addEventListener("click", stageDelete);
+$("ai-explorer-search").addEventListener("input", function () {
+  aiExplorer.search = $("ai-explorer-search").value;
+  renderAiExplorer();
+});
+$("btn-ai-explorer-refresh").addEventListener("click", function () {
+  refreshExplorer(true, state.ai ? state.ai.name : "ai");
+});
 $("explorer-search").addEventListener("input", function () {
   explorer.search = $("explorer-search").value;
   renderExplorer();
 });
-$("btn-explorer-refresh").addEventListener("click", function () { refreshExplorer(true); });
+$("btn-explorer-refresh").addEventListener("click", function () { refreshExplorer(true, "admin"); });
 $("btn-explorer-upload").addEventListener("click", function () { $("explorer-file-input").click(); });
 $("explorer-file-input").addEventListener("change", function () {
   stageAdminFiles($("explorer-file-input").files, explorer.currentPath);

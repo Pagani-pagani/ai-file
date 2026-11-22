@@ -1,10 +1,10 @@
-AI File v1.4 — 檔案清單
+AI File v1.5 — 檔案清單
 ========================
 
 根目錄
   agent.md              專案說明（架構、安全模型、流程、版本歷史）
   README.md             安裝與使用說明
-  VERSION               版本號（目前是 1.4）
+  VERSION               版本號（目前是 1.5）
   .gitignore            ai-file-config.json、ai-file-log.txt、ai-file-history.json、
                         ai-file-backup/ 絕不進版控
   index.html            GitHub Pages 網站（靜態 SPA，全部繁體中文）
@@ -13,11 +13,13 @@ AI File v1.4 — 檔案清單
 
 agent/（Windows 本地端，Python 標準函式庫，不用 pip）
   ai_file_agent.py      本地端主程式：設定精靈、輪詢、通知、浮動視窗、立即同步、
-                        桌面捷徑、自動更新、連線狀態、重設資料、備份與返回
+                        桌面捷徑、自動更新、連線狀態、重設資料、備份與返回、
+                        系統匣常駐（Windows，ctypes）、背景輪詢、activity 寫入重試
   啟動 AI File.bat      主要啟動器（pythonw.exe，不跳黑視窗）
   啟動 AI File.vbs      備援啟動器（也是桌面捷徑的目標）
   自我檢查.py           自我檢查：設定檔、路徑守門、雜湊驗證、停止旗標、同步流程、
-                        版本比對、連線診斷、備份與返回
+                        版本比對、連線診斷、備份與返回、activity 寫入重試、
+                        manifest 併入、系統匣 no-op、背景輪詢
   檔案清單.txt          就是這個檔案
 
 啟動後才會產生的檔案（只存本機，不在 repo 裡）

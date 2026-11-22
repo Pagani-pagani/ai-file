@@ -35,11 +35,16 @@
       </div>
     </div>
     <p class="hint landing-pat">GitHub 金鑰：<span id="landing-pat-state">未設定</span>（金鑰只存在這個瀏覽器；換瀏覽器、開無痕視窗、或瀏覽器設定成關閉時清除網站資料，都要重新設定。）</p>
+    <div class="landing-status">
+      <button id="btn-status-view" class="btn btn-outline btn-big">目前狀態</button>
+      <p class="hint">看看電腦現在連上沒有、正在工作的資料夾是哪一個。</p>
+    </div>
   </section>
 
-  <!-- 連線狀態：登入後才顯示 -->
+  <!-- 目前狀態：獨立畫面，只有從進入畫面點「目前狀態」才看得到 -->
   <section class="card hidden" id="status-card">
-    <h2>連線狀態</h2>
+    <div class="back-row"><button id="btn-back-status" class="btn btn-outline">← 返回</button></div>
+    <h2>目前狀態</h2>
     <p class="status-line"><span id="status-dot" class="dot dot-grey"></span><span id="status-text">尚未連線</span></p>
     <dl class="kv">
       <div><dt>正在工作的資料夾</dt><dd id="kv-folder">—</dd></div>
@@ -100,6 +105,7 @@
     </div>
     <p class="hint"><span id="explorer-status" class="badge">尚未載入</span> <span id="explorer-count"></span></p>
     <p class="explorer-crumbs" id="explorer-crumbs"></p>
+    <hr class="explorer-divider">
     <div class="explorer-wrap">
       <table class="explorer-table">
         <thead><tr><th class="col-check"></th><th>名稱</th><th>副檔名</th><th>建立時間</th><th>大小</th><th>種類</th><th></th></tr></thead>
@@ -112,14 +118,20 @@
       <button id="btn-explorer-cancel" class="btn btn-outline">取消</button>
     </div>
 
-    <h3>過去所有異動紀錄</h3>
-    <p class="hint">同一批同步會整理成一組，旁邊的「返回」可以回到同步前的狀態（要等本地端確認）。</p>
-    <ul id="activity-list" class="list"><li class="hint">還沒有紀錄。</li></ul>
-    <button id="btn-refresh-activity" class="btn btn-outline">重新整理紀錄</button>
+    <div class="section-head">
+      <h3>過去所有異動紀錄</h3>
+      <label class="toggle"><input type="checkbox" id="toggle-activity"> <span>顯示</span></label>
+    </div>
+    <div id="activity-body" class="hidden">
+      <p class="hint">同一批同步會整理成一組，旁邊的「返回」可以回到同步前的狀態（要等本地端確認）。</p>
+      <ul id="activity-list" class="list"><li class="hint">還沒有紀錄。</li></ul>
+      <button id="btn-refresh-activity" class="btn btn-outline">重新整理紀錄</button>
+    </div>
   </section>
 
   <!-- 管理員帳號設定 / 登入 -->
   <section class="card hidden" id="admin-auth">
+    <div class="back-row"><button id="btn-back-admin" class="btn btn-outline">← 返回</button></div>
     <h2 id="admin-auth-title">管理員登入</h2>
     <div id="admin-setup" class="hidden">
       <p>第一次使用，請先設定管理員帳號密碼（只鎖這個瀏覽器）。</p>
@@ -142,6 +154,7 @@
 
   <!-- AI 登入 -->
   <section class="card hidden" id="ai-auth">
+    <div class="back-row"><button id="btn-back-ai" class="btn btn-outline">← 返回</button></div>
     <h2>AI 登入</h2>
     <p>請輸入你的名稱和使用者給你的工作階段代碼。金鑰已經由管理員在這個瀏覽器設定過一次，不用再貼。</p>
     <label for="ai-name">AI 名稱</label>
@@ -180,6 +193,22 @@
     <input type="text" id="delete-path" placeholder="例如：程式/舊檔案.txt" autocomplete="off">
     <div class="row">
       <button id="btn-stage-delete" class="btn btn-danger">暫存刪除要求</button>
+    </div>
+
+    <h3>檔案總管</h3>
+    <p class="hint">看看電腦上的資料夾裡有什麼（只能看，不能在這裡改）。電腦開著會顯示即時內容，沒開就顯示上次的快照。點資料夾可以進去看。</p>
+    <div class="explorer-toolbar">
+      <input type="text" id="ai-explorer-search" placeholder="搜尋檔案…" autocomplete="off">
+      <button id="btn-ai-explorer-refresh" class="btn btn-outline">重新整理</button>
+    </div>
+    <p class="hint"><span id="ai-explorer-status" class="badge">尚未載入</span> <span id="ai-explorer-count"></span></p>
+    <p class="explorer-crumbs" id="ai-explorer-crumbs"></p>
+    <hr class="explorer-divider">
+    <div class="explorer-wrap">
+      <table class="explorer-table">
+        <thead><tr><th>名稱</th><th>副檔名</th><th>建立時間</th><th>大小</th><th>種類</th></tr></thead>
+        <tbody id="ai-explorer-list"></tbody>
+      </table>
     </div>
 
     <h3>我暫存的檔案</h3>
@@ -241,7 +270,7 @@
 </div>
 
 <footer class="footer">
-  <p>AI File v1.4 — 檔案先暫存、你看過才同步、隨時能停止。</p>
+  <p>AI File v1.5 — 檔案先暫存、你看過才同步、隨時能停止。</p>
   <button id="btn-logout" class="btn btn-outline hidden">登出</button>
 </footer>
 <script src="app.js"></script>

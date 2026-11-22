@@ -55,6 +55,9 @@ GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到使用者�
 - 輪詢中繼 repo：心跳、工作階段、停止旗標、待同步；輪詢失敗會更新浮動視窗的連線狀態行，不再只寫 log。
 - 桌面通知（ctypes MessageBox／tkinter 置頂彈窗）：新工作階段、新增／刪除檔案、越界嘗試、立即同步。
 - 浮動視窗（tkinter 置頂小視窗）：逐條列出 Muse 動了哪些檔案，附大大的停止鈕；另有連線狀態行與「建立桌面捷徑」「檢查更新」「測試連線」「重設資料」「紀錄」「結束程式」按鈕。按 X 只會隱藏視窗、程式還在跑，視窗上有提示，要真正結束請按「結束程式」。
+- 系統匣常駐（Windows，v1.5）：只用 ctypes 標準函式庫，不用 pywin32；Shell_NotifyIconW 建立圖示（優先從 pythonw.exe 用 ExtractIcon 抓，抓不到用 IDI_APPLICATION），提示文字「AI File」；隱藏視窗＋daemon 訊息迴圈執行緒（Python WndProc 用 ctypes WINFUNCTYPE）；右鍵選單只有「顯示視窗」「結束程式」，左鍵雙擊顯示視窗；選單命令用 queue 傳回 tkinter 主執行緒（main 裡 root.after 每 0.5 秒取一次）。非 Windows 上 start() 直接回傳 False，不報錯、不影響啟動。
+- 輪詢與啟動網路全部在背景執行緒（v1.5）：`poll_in_thread()` 每 5 秒跑一輪（重疊保護，同時只跑一輪）；啟動時的工作階段重設、檢查更新、心跳、快照也在背景跑，浮動視窗先出來，不等網路。TkUI 全部用 queue＋主執行緒 50ms 消化迴圈轉回主執行緒（notify／確認窗／狀態列／結束程式）：tkinter 的 root.after 不能在背景執行緒呼叫，會報 main thread is not in main loop。
+- 寫入重試（v1.5）：activity.json、manifest、session.json 都是讀-改-寫，寫入用讀到的那個 sha（不再另外重取）；讀到不存在時用 create_only（PUT 不帶 sha，檔案若在那一瞬間被別人建立了，GitHub 擋下 409／422）；409／422 就重讀最新內容再寫，最多重試 3 次（重試前隨機等 50–200ms 錯開碰撞）；讀不到就不寫；重試後還是失敗明確報錯，不假裝存成功。manifest 更新是「重讀最新清單、扣掉已處理的項目」，不會蓋掉網頁端同時暫存的新項目。
 - 每次啟動時，如果中繼的 session 還是上次的 approved，重設回 waiting（AI 要重新取得一次「是」才行，重開程式不等於自動同意）。
 - 快照：每次啟動完成後、每次同步／返回／重新命名完成後，對允許的資料夾做一次快照寫到中繼的 `snapshot.json`（遞迴清單，上限 2000 筆，不讀內容、不算雜湊）；輪詢時看到 `list_request.json` 就重新產生快照；看到 `content_request.json` 就讀檔（10 MB 以下）回寫 `content_response.json`。快照不依賴工作階段狀態；停止時只回答快照要求，不讀檔案內容。
 - 套用同步：只寫入允許的資料夾內、驗證雜湊、寫入本機 `ai-file-log.txt` 與中繼 `activity.json`（每筆帶 batch_id）。支援 `rename`（先備份舊路徑再改名，new_rel 也要過守門）和資料夾刪除（套用前整棵樹先備份，返回時整棵複製回來）。管理員在檔案總管暫存的項目（`by="admin"`）不用等工作階段核准、不用檢查工作階段代碼（那是使用者本人用自己的金鑰寫的，真正的授權是同步確認窗的「同意」），但一樣要過停止旗標與路徑守門，一樣要按「同意」才套用。
@@ -62,7 +65,7 @@ GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到使用者�
 - 本機資料：程式資料夾裡的 `ai-file-config.json`、`ai-file-log.txt`、`ai-file-history.json`、`ai-file-backup/`，沒有登錄檔、沒有 AppData；「重設資料」按鈕確認後刪除全部並重開設定精靈。
 - 套用同步：只寫入允許的資料夾內、驗證雜湊、寫入本機 `ai-file-log.txt` 與中繼 `activity.json`（每筆帶 batch_id）。
 - `啟動 AI File.bat`：用 pythonw.exe 啟動（已簽署，避開 Smart App Control），另附 `啟動 AI File.vbs` 備援。
-- `自我檢查.py`、`檔案清單.txt`、`VERSION`（根目錄，內容只有版本號，v1.4 = `1.4`）。
+- `自我檢查.py`、`檔案清單.txt`、`VERSION`（根目錄，內容只有版本號，v1.5 = `1.5`）。
 
 ## 檔案清單（公開 repo）
 - `index.html`、`app.js`、`style.css`（GitHub Pages 網站，放在 repo 根目錄；v1.1 之前在 `web/`，Pages 只認根目錄所以首頁顯示成 README，已移出並刪除 `web/`）
@@ -74,7 +77,7 @@ GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到使用者�
 - GitHub Pages 沒有伺服器，所以「即時」其實是輪詢（預設每 5 秒即時模式、每 30 秒心跳），不是真正的即時推播。
 - 檔案要經過 GitHub 中繼 repo：單檔建議 1 MB 以下（Contents API 限制），不適合傳幾百 MB 的大檔。
 - PAT 要使用者在 GitHub 設定裡親手產生一次（細粒度、只給 `ai-file-relay`），Muse 不能代勞。
-- Windows 的 .bat 啟動器與桌面通知無法在 Linux VM 上實測，只能測核心邏輯（輪詢、路徑守門、雜湊驗證、停止旗標）與 tkinter 介面（xvfb）。
+- Windows 的 .bat 啟動器、桌面通知、系統匣圖示無法在 Linux VM 上實測，只能測核心邏輯（輪詢、路徑守門、雜湊驗證、停止旗標）與 tkinter 介面（xvfb）；系統匣在 Linux 上只測到 start() 回傳 False、poll／stop 不報錯。
 - 管理員密碼只鎖瀏覽器介面；真正的保護是 PAT 範圍＋工作階段代碼＋本地端守門。
 - v1.2 新增的桌面捷徑（WScript.Shell）、自動更新下載、Windows 桌面通知無法在 Linux VM 上實測；連線診斷改用本機假 GitHub API 伺服器測過，但真實 PAT 連線仍需使用者在 Windows 上實測。
 
@@ -98,3 +101,14 @@ GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到使用者�
   3. 檔案操作（全部走 manifest 暫存＋電腦按「同意」才套用）：檔案雙擊（手機按「⋯」）開操作選單：下載、編輯、刪除、多選；資料夾操作選單：重新命名、刪除（刪除前明確顯示裡面有幾個檔案）。下載／編輯向電腦索取內容（`content_request.json` → `content_response.json`，上限 10 MB，超時或電腦沒開顯示「電腦沒開，無法讀取檔案內容」）；編輯只支援文字檔白名單（txt／md／json／js／py／html／css／csv／log／xml／ini／bat／ps1，≤200KB），否則顯示「這個檔案不能在網頁上編輯，請下載後修改再上傳覆蓋」。多選後按確認，跳對話框問要「刪除」還是「重新命名（變更）」（重新命名對話框每項各一個輸入框預填目前檔名）。重新命名是新的 manifest entry（{action:"rename", rel, new_rel}），本地端先備份再 os.rename，new_rel 也要過守門；返回時把檔案從 new_rel 改回 rel（new_rel 不存在或 rel 已被佔用就跳過並記 log，不誤刪）。資料夾刪除的 entry 帶 is_dir，本地端套用前整棵樹先備份再 rmtree，返回時整棵複製回來。
   4. 管理員自己的項目（`by="admin"`）不用等工作階段核准、不用檢查工作階段代碼（使用者本人用自己的金鑰寫的，真正的授權是同步確認窗的「同意」），但一樣要過停止旗標與路徑守門，一樣要按「同意」才套用。停止時檔案總管只能看快照和重新整理，不能下載／編輯／暫存變更，要先恢復。
   - 測試紀錄（2026-11-22，Linux VM）：`py_compile` 全部通過；`node --check app.js` 通過；app.js 用的 81 個元素 ID 全部在 index.html 裡（`explorer-edit-text` 是編輯對話框動態建立的，不在靜態 HTML 裡）。自我檢查 53/53 通過（假設定＋假 GitHub 跑法，`/tmp/check_v14.py`）。單元測試 29/29 通過（`/tmp/test_v14.py`）：快照遞迴＋上限＋種類、重新命名套用／返回／跳脫拒絕／目標已存在不覆蓋／返回時 new_rel 不見或 rel 被佔用就跳過、資料夾刪除備份／返回、管理員項目不用工作階段核准、AI 項目仍要核准且代碼不符拒收、list_request／content_request（含越界、找不到、超過 10 MB、停止時不讀內容）。app.js Node 測試 41/41 通過（`/tmp/test_app_v14.js`，vm＋假 DOM／假 GitHub API）：大小與時間格式化、子項目篩選、搜尋（不分大小寫、遞迴、資料夾本身也算）、排序、資料夾內檔案數、狀態徽章、渲染（根目錄／子資料夾／空資料夾／搜尋零筆）、多選確認流程、重新命名對話框與暫存、資料夾刪除確認訊息、即時重新整理、索取內容、編輯對話框與儲存、上傳。xvfb GUI 測試 13/13 通過（`/tmp/gui_test_v14.py`）：浮動視窗開啟、快照發佈、list／content 要求、重新命名與資料夾刪除套用／返回、紀錄視窗、結束程式。測試中抓到一個真 bug 並修掉：一次暫存多個檔案時，manifest 是讀出來、改好、寫回去，並行寫會互相蓋掉（少一筆）——加了 `stageQueue` 讓所有暫存寫入排隊執行（AI 與管理員共用；activity.json 的讀寫也一起排隊）。未測：Windows 上真正的檔案建立時間、真正的 PAT 連線、真正的備份還原在 Windows 上的實際操作、瀏覽器裡的完整流程（檔案總管→暫存→電腦同意同步→返回）、Windows 桌面通知。
+- v1.5（2026-11-22）：修使用者回報的 9 個問題。VERSION 1.4 → 1.5。
+  1. 返回不用重新整理：AI／管理員登入畫面的「返回」改成純畫面切換（隱藏登入畫面、顯示主畫面兩張大卡片＋目前狀態），不做 location.reload、不重抓資料。
+  2. AI 登入後不要再顯示 AI 登入的小視窗：登入成功就隱藏 ai-auth、只顯示 ai-panel（＋頁面最下方的登出）；登出才回主畫面。
+  3. AI 的「暫存檔案」區改成檔案總管樣式：管理員和 AI 共用同一套渲染（renderExplorerView），AI 的是唯讀瀏覽（同一份快照：名稱／副檔名／建立時間／大小／種類，點資料夾可進入），下面列「我暫存的檔案」（每筆有取消暫存）。上傳／貼上／要求刪除維持原有流程與核准規則（要等電腦按「是」＋按「同意」才套用）。
+  4. 管理員介面上方的連線狀態刪掉：連線狀態只留在獨立的「目前狀態」畫面（主畫面「目前狀態」按鈕進去，按「返回」回主畫面）。管理員面板保留金鑰設定、資料夾／代碼／重新生成、停止／恢復、檔案總管、待同步清單、異動紀錄。AI 介面的工作階段狀態那行（ai-session-state）保留。
+  5. GitHub 的紀錄儲存後重新整理就不見了——查到的真正原因有三個：(a) activity.json 是讀-改-寫，網頁端和本地端同時寫會互相蓋掉（後寫的蓋掉先寫的）；v1.4 的 stageQueue 只解決了網頁端自己並行寫的問題。(b) 寫入時 `_put` 會另外重取一次 sha：讀到的資料是舊的、sha 卻是新的，舊內容配新 sha 就成功蓋掉別人的寫入，連 409 都不會報。(c) 讀取失敗時程式把 data 當成空清單寫回去，直接蓋掉整份紀錄。修法：寫入用讀到的那個 sha（不再另外重取）；讀到不存在時用 create_only（PUT 不帶 sha，檔案若在那一瞬間被別人建立了，GitHub 擋下 409／422）；409／422 就重讀最新內容再寫，最多重試 3 次（重試前隨機等 50–200ms 錯開碰撞）；讀不到就不寫、回傳 False；重試後還是失敗明確報錯。manifest 更新改成「重讀最新清單、扣掉已處理的項目」，不會蓋掉網頁端同時暫存的新項目。網頁端（ghUpdateJson／ghPutFile／ghDeleteFile）和本地端（GitHubRelay._put／append_activity／_update_manifest_remove）用同一套邏輯。
+  6. 檔案總管中間切一條線：工具列／搜尋區與檔案列表之間加 `<hr class="explorer-divider">`，列表列高、行距、留白加大（儲存格 padding 7px 8px → 12px 10px，line-height 1.6）。管理員和 AI 的檔案總管都一樣。
+  7. 異動狀態加開關：異動紀錄區塊旁邊加「顯示」開關，預設關閉（整個區塊隱藏），狀態存 localStorage `aifile_show_activity`，重新整理後維持上次的狀態；隱藏時只是不顯示，返回（undo）功能不受影響。
+  8. 效能——查到的真正瓶頸：(a) 本地端 main() 在進主迴圈之前，先在主執行緒同步做檢查更新（15 秒逾時）、心跳、快照——GitHub 慢就卡在啟動畫面甚至打不開。(b) 每 5 秒的輪詢在主執行緒跑，約 8 次循序 GitHub API 呼叫（每次逾時 30 秒），整個浮動視窗凍住。(c) 網頁端 fetch 沒有逾時，卡住的請求永遠不回來。修法：本地端輪詢與啟動網路全部改背景執行緒（poll_in_thread＋重疊保護，TkUI 全部用 queue＋主執行緒 50ms 消化迴圈轉回主執行緒——查核發現 tkinter 的 root.after 不能在背景執行緒呼叫，會報 main thread is not in main loop；舊的 call_on_main 只是吞掉例外、直接在背景執行緒動 UI，v1.5 改成 queue 傳遞）；網頁端所有 fetch 加 10 秒逾時（AbortController），逾時報錯放開畫面；日常操作不顯示全螢幕載入畫面（本來就沒有全螢幕載入遮罩，使用者看到的 3 秒載入是卡住的網路請求；改成按鈕自己的忙碌狀態）；頁面第一次顯示不等待任何網路請求；切換畫面／登出清掉不需要的定時器（waitGen 世代計數，進行中的等待自己停下來）；檔案總管重新整理等待改成背景輪詢，只更新徽章與提示文字。另外說明：使用者描述的「目前狀態」畫面與 3 秒載入畫面在 v1.4 程式碼裡並不存在（grep 確認沒有 loading overlay、沒有 location.reload、沒有「目前狀態」文字），很可能是瀏覽器快取了舊版 index.html（v1.2 的狀態卡片一直在進入畫面）；v1.5 正式做了獨立的「目前狀態」畫面，舊版面殘留時請按 Ctrl+F5 強制重新整理。
+  9. 本地端常駐系統匣（Windows）：只用 Python 標準函式庫（ctypes），不用 pywin32、不加 pip 依賴；只在 Windows 啟用，其他平台安靜跳過。Shell_NotifyIconW 建立圖示（圖示優先從 pythonw.exe 用 ExtractIcon 抓，抓不到用 IDI_APPLICATION），提示文字「AI File」；隱藏視窗＋daemon 訊息迴圈執行緒（Python WndProc 用 ctypes WINFUNCTYPE）；右鍵選單只有「顯示視窗」「結束程式」，左鍵雙擊顯示視窗；選單命令用 queue 傳回 tkinter 主執行緒（main 裡 root.after 每 0.5 秒取一次）。浮動視窗按 X 照舊只是隱藏，系統匣圖示留著；右鍵「結束程式」才是真的結束（先移除系統匣圖示再關視窗）。README 加系統匣用法一節。
+  - 測試紀錄（2026-11-22，Linux VM）：`py_compile` 全部通過；`node --check app.js` 通過。自我檢查 66/66 通過（假設定＋假 GitHub 跑法，`/tmp/check_v15.py`，第 14 步新增：寫入重試 409 後成功、一直 409 會報錯、兩邊同時寫不丟、重試耗盡回傳 False、manifest 併入、409 後重試成功、系統匣 no-op、背景輪詢）。單元測試 14/14 通過（`/tmp/test_v15.py`）：真 HTTP 假伺服器（檢查 sha、422／409 照實回）：SHA 衝突重試、重試耗盡報錯、5 執行緒各寫 5 筆 activity 25 筆都在（連跑 5 次都通過）、append_activity 重試耗盡回傳 False、manifest 併入、LocalRelay 接受 retry 參數、系統匣 no-op、背景輪詢、路徑守門、快照、版本。Node 測試 40/40 通過（`/tmp/test_app_v15.js`，vm＋假 DOM／假 GitHub API）：返回不重新整理、AI 登入後登入卡片隱藏、目前狀態獨立畫面、異動紀錄開關與 localStorage 記憶、日常操作不出現全螢幕載入、fetch 逾時、appendActivity 409／422 競寫不丟、AI 檔案總管渲染／搜尋／進資料夾。xvfb GUI 測試 20/20 通過（`/tmp/gui_test_v15.py`）：浮動視窗開啟、X 只隱藏、再打開叫得回來、call_on_main_sync、背景輪詢不卡 UI、測試連線／桌面捷徑／紀錄／停止按鈕、系統匣「結束程式」真的關掉程式。測試中抓到的真 bug（都修了）：(1) 5 執行緒並行寫 activity 時 3 次重試會被連續撞掉——重試前加隨機延遲。(2) 更深的靜默遺失：`_put` 另外重取 sha，舊內容配新 sha 成功蓋掉——寫入改用讀到的 sha＋create_only。(3) 讀取失敗時當成空清單寫回去蓋掉整份——讀不到就不寫。(4) tkinter root.after 不能在背景執行緒呼叫——改成 queue＋主執行緒消化迴圈。未測：Windows 上真正的系統匣行為、真正的 PAT 連線、真正的備份還原在 Windows 上的實際操作、瀏覽器裡的完整流程、Windows 檔案建立時間。

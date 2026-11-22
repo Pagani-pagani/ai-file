@@ -20,6 +20,8 @@ import base64
 import hashlib
 import json
 import os
+import queue
+import random
 import secrets
 import shutil
 import subprocess
@@ -33,7 +35,8 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 
-VERSION_DEFAULT = "1.4"
+VERSION_DEFAULT = "1.5"
+WRITE_RETRY_MAX = 3  # 寫入遇到 409（檔案剛被另一邊改過）最多重試幾次
 RELAY_OWNER = "Pagani-pagani"
 RELAY_REPO = "ai-file-relay"
 GITHUB_API = "https://api.github.com"
@@ -309,10 +312,12 @@ class RelayClient:
     def get_bytes(self, path):
         raise NotImplementedError
 
-    def put_json(self, path, data, message):
+    def put_json(self, path, data, message, retry=True, sha=None,
+                 create_only=False):
         raise NotImplementedError
 
-    def put_bytes(self, path, data, message):
+    def put_bytes(self, path, data, message, retry=True, sha=None,
+                  create_only=False):
         raise NotImplementedError
 
     def delete(self, path, message):
@@ -402,20 +407,55 @@ class GitHubRelay(RelayClient):
             return None, None
         return base64.b64decode(res["content"]), res.get("sha")
 
-    def _put(self, path, content_b64, message):
-        # Contents API 更新檔案需要目前的 sha；先 GET 取一次（不存在就沒有 sha）
-        res = self._request("GET", path)
-        body = {"message": message, "content": content_b64}
-        if res is not None:
-            body["sha"] = res.get("sha")
-        return self._request("PUT", path, body)
+    def _put(self, path, content_b64, message, retry=True, sha=None,
+             create_only=False):
+        # Contents API 更新檔案需要目前的 sha。
+        # sha=None（沒指定）：先 GET 取一次（單純覆寫用，例如心跳、停止旗標）。
+        # sha 有值：直接用這個 sha，不再另外 GET——呼叫端讀到的資料和
+        # sha 是同一份才不會寫錯（讀-改-寫一定要用讀到的那個 sha；
+        # 另外重取 sha 會讓舊內容配上新 sha，成功蓋掉別人的寫入）。
+        # create_only=True：呼叫端讀過了，檔案當時不存在——PUT 不帶 sha、
+        # 也不另外 GET；檔案若在那一瞬間被別人建立了，GitHub 會擋下
+        # （409 或 422），由呼叫端重讀再寫，絕對不能用新 sha 重寫舊內容。
+        # 內部自動重試只在「單純覆寫」（sha=None 且不是 create_only）時做：
+        # 有指定 sha 或 create_only 時 409/422 就直接報錯，由呼叫端重讀。
+        attempts = 0
+        while True:
+            attempts += 1
+            if create_only:
+                body_sha = None
+            elif sha is not None:
+                body_sha = sha
+            else:
+                res = self._request("GET", path)
+                body_sha = res.get("sha") if res is not None else None
+            body = {"message": message, "content": content_b64}
+            if body_sha is not None:
+                body["sha"] = body_sha
+            try:
+                return self._request("PUT", path, body)
+            except RelayError as e:
+                status = getattr(e, "status", None)
+                if retry and not create_only and sha is None \
+                        and status in (409, 422) \
+                        and attempts < WRITE_RETRY_MAX:
+                    log_local("寫入 %s 遇到 %s（檔案剛被另一邊改過），"
+                              "重試第 %d 次" % (path, status, attempts))
+                    # 隨機等一下再重試：兩邊同時寫時才不會一直撞在同一個時間點
+                    time.sleep(0.05 + random.random() * 0.15)
+                    continue
+                raise
 
-    def put_json(self, path, data, message):
+    def put_json(self, path, data, message, retry=True, sha=None,
+                 create_only=False):
         raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        self._put(path, base64.b64encode(raw).decode("ascii"), message)
+        self._put(path, base64.b64encode(raw).decode("ascii"), message,
+                  retry=retry, sha=sha, create_only=create_only)
 
-    def put_bytes(self, path, data, message):
-        self._put(path, base64.b64encode(data).decode("ascii"), message)
+    def put_bytes(self, path, data, message, retry=True, sha=None,
+                  create_only=False):
+        self._put(path, base64.b64encode(data).decode("ascii"), message,
+                  retry=retry, sha=sha, create_only=create_only)
 
     def delete(self, path, message):
         res = self._request("GET", path)
@@ -450,12 +490,18 @@ class LocalRelay(RelayClient):
             raw = f.read()
         return raw, sha256_bytes(raw)
 
-    def put_json(self, path, data, message):
+    def put_json(self, path, data, message, retry=True, sha=None,
+                 create_only=False):
         raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         self.put_bytes(path, raw, message)
 
-    def put_bytes(self, path, data, message):
+    def put_bytes(self, path, data, message, retry=True, sha=None,
+                  create_only=False):
         full = self._full(path)
+        if create_only and os.path.exists(full):
+            # 本機模擬 GitHub 的擋下行為：只准建立，已存在就報 409
+            raise RelayError("檔案 %s 已存在" % path, status=409)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "wb") as f:
             f.write(data)
@@ -515,20 +561,61 @@ def prune_history(history):
 
 
 def append_activity(relay, entry):
-    """把一筆紀錄 append 到中繼的 activity.json。"""
-    try:
-        data, _ = relay.get_json("activity.json")
-    except Exception:
-        data = None
-    if not isinstance(data, list):
-        data = []
-    entry = dict(entry)
-    entry.setdefault("at", utcnow_iso())
-    data.append(entry)
-    try:
-        relay.put_json("activity.json", data, "AI File：新增活動紀錄")
-    except Exception as e:
-        log_local("寫入 activity.json 失敗：%s" % e)
+    """把一筆紀錄 append 到中繼的 activity.json，回傳 True／False。
+    activity.json 是讀-改-寫：網頁端也同時寫，兩邊同時寫會互相蓋掉
+    （後寫的蓋掉先寫的，紀錄就「存了又不見」）。
+    修法：409／422 就重讀最新內容、重新補一筆再寫，最多重試 3 次；
+    重試後還是失敗就回傳 False（只寫 log，不假裝存成功）。
+    注意：這裡用 retry=False 呼叫 put_json——重試必須由這層重讀
+    最新內容再寫，只換 sha 重寫同一份舊內容還是會蓋掉對方那筆；
+    讀到檔案不存在時用 create_only（PUT 不帶 sha），檔案若在那一瞬間
+    被別人建立了，GitHub 會擋下（409／422），這層重讀再寫。"""
+    for attempt in range(1, WRITE_RETRY_MAX + 1):
+        try:
+            data, sha = relay.get_json("activity.json")
+        except Exception as e:
+            # 讀不到就不要寫：把 data 當成空清單寫回去會蓋掉整份紀錄。
+            # 重試幾次讀取，還是不行就回傳 False（不假裝存成功）。
+            log_local("讀取 activity.json 失敗（第 %d 次）：%s" % (attempt, e))
+            if attempt < WRITE_RETRY_MAX:
+                time.sleep(0.05 + random.random() * 0.15)
+                continue
+            return False
+        if not isinstance(data, list):
+            data = []
+        entry = dict(entry)
+        entry.setdefault("at", utcnow_iso())
+        data.append(entry)
+        try:
+            # 寫入用剛才讀到的那個 sha：資料和 sha 是同一份才不會寫錯。
+            # 讀到不存在（sha 是 None）時用 create_only：PUT 不帶 sha，
+            # 檔案若在那一瞬間被別人建立了，GitHub 會擋下（409/422），
+            # 這層重讀再寫，絕對不用新 sha 重寫舊內容。
+            relay.put_json("activity.json", data, "AI File：新增活動紀錄",
+                           retry=False, sha=sha, create_only=(sha is None))
+            return True
+        except RelayError as e:
+            if getattr(e, "status", None) in (409, 422) \
+                    and attempt < WRITE_RETRY_MAX:
+                log_local("寫入 activity.json 遇到 %s，重試第 %d 次"
+                          % (getattr(e, "status", "?"), attempt))
+                time.sleep(0.05 + random.random() * 0.15)
+                continue
+            log_local("寫入 activity.json 失敗（已重試 %d 次）：%s"
+                      % (WRITE_RETRY_MAX, e))
+            return False
+        except Exception as e:
+            log_local("寫入 activity.json 失敗：%s" % e)
+            return False
+    return False
+
+
+def _manifest_entry_key(entry):
+    """暫存項目的比對鍵：有 id 用 id，舊資料用路徑＋動作＋AI 名稱＋時間。"""
+    if entry.get("id"):
+        return ("id", entry["id"])
+    return ("k", entry.get("rel_path", ""), entry.get("action", ""),
+            entry.get("ai_name", ""), entry.get("time", ""))
 
 
 def test_connection(relay):
@@ -692,13 +779,83 @@ class TkUI:
         self.float_status = None
         self.float_conn = None
         self.float_code = None
+        self.tray_available = False  # 系統匣圖示有沒有成功建立（main 啟動時設定）
+        # 主執行緒工作佇列：tkinter 只能在主執行緒動，背景執行緒想動介面
+        # 就把工作放進這個 queue，由主執行緒的 root.after 迴圈消化。
+        # （root.after 不能在背景執行緒呼叫，會報 main thread is not
+        # in main loop；所以這裡不用 after 跨執行緒，只用 queue 傳遞。）
+        self._main_queue = queue.Queue()
+        self._drain_scheduled = False
+        self._ensure_drain()
+
+    def _ensure_drain(self):
+        """確保主執行緒定期消化 queue（root.after 迴圈，只在主執行緒排）。"""
+        if self._drain_scheduled:
+            return
+        self._drain_scheduled = True
+
+        def drain():
+            # 程式正在關閉就不要再排了；任何例外都吞掉，
+            # 不然 Tcl 會把 after 回呼的錯誤印到 stderr
+            try:
+                if not self.root.winfo_exists():
+                    self._drain_scheduled = False
+                    return
+            except Exception:
+                self._drain_scheduled = False
+                return
+            try:
+                self.drain_main_queue()
+            except Exception:
+                pass
+            try:
+                self.root.after(50, drain)
+            except Exception:
+                self._drain_scheduled = False
+        try:
+            self.root.after(50, drain)
+        except Exception:
+            self._drain_scheduled = False
+
+    def drain_main_queue(self):
+        """主執行緒呼叫：把 queue 裡排隊的工作全部跑完。"""
+        while True:
+            try:
+                fn, done, result = self._main_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                result["value"] = fn()
+            except Exception as e:
+                result["error"] = e
+            finally:
+                if done is not None:
+                    done.set()
 
     def call_on_main(self, fn):
-        """背景執行緒想動介面時用這個，保證在主執行緒跑。"""
-        try:
-            self.root.after(0, fn)
-        except Exception:
-            fn()
+        """背景執行緒想動介面時用這個：放進 queue，保證在主執行緒跑。"""
+        self._ensure_drain()
+        self._main_queue.put((fn, None, {}))
+
+    def call_on_main_sync(self, fn):
+        """背景執行緒想動介面、又要等結果時用這個：在主執行緒跑完才回傳。
+        已經在主執行緒就直接跑（不會自己等自己）。"""
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        self._ensure_drain()
+        done = threading.Event()
+        result = {}
+        self._main_queue.put((fn, done, result))
+        done.wait()
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def _on_main(self, fn):
+        """動介面的方法共用：在主執行緒跑，背景執行緒呼叫就等它跑完。
+        輪詢改成背景執行緒後，notify／確認窗／狀態列都走這裡，
+        才不會在背景執行緒裡直接碰 tkinter。"""
+        return self.call_on_main_sync(fn)
 
     def quit_app(self):
         """1.5 秒後關掉主視窗（更新流程用，讓「正在更新」先顯示一下）。"""
@@ -709,56 +866,62 @@ class TkUI:
 
     # -- 通知與確認 ------------------------------------------------
     def notify(self, title, message):
-        import tkinter.messagebox as mb
-        try:
-            self.root.attributes("-topmost", True)
-            mb.showinfo(title, message, parent=self.root)
-        except Exception:
-            print("[通知] %s：%s" % (title, message))
+        def run():
+            import tkinter.messagebox as mb
+            try:
+                self.root.attributes("-topmost", True)
+                mb.showinfo(title, message, parent=self.root)
+            except Exception:
+                print("[通知] %s：%s" % (title, message))
+        self._on_main(run)
 
     def ask_yes_no(self, title, message):
-        import tkinter.messagebox as mb
-        try:
-            self.root.attributes("-topmost", True)
-            return bool(mb.askyesno(title, message, parent=self.root))
-        except Exception:
-            return False
+        def run():
+            import tkinter.messagebox as mb
+            try:
+                self.root.attributes("-topmost", True)
+                return bool(mb.askyesno(title, message, parent=self.root))
+            except Exception:
+                return False
+        return self._on_main(run)
 
     def ask_sync(self, changes):
         """立即同步確認窗：列出變更清單，使用者按「同意」才回傳 True。"""
-        import tkinter as tk
-        from tkinter import ttk
-        result = {"ok": False}
-        win = tk.Toplevel(self.root)
-        win.title("AI File：立即同步")
-        win.attributes("-topmost", True)
-        win.geometry("560x420")
-        ttk.Label(win, text="Muse 想同步以下變更到你的電腦：",
-                  font=("Microsoft JhengHei", 12, "bold")).pack(
-                      anchor="w", padx=16, pady=(14, 6))
-        ttk.Label(win, text="請先看過清單，確認沒問題再按「同意同步」。",
-                  font=("Microsoft JhengHei", 10)).pack(
-                      anchor="w", padx=16, pady=(0, 8))
-        frame = ttk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=16)
-        lb = tk.Listbox(frame, font=("Microsoft JhengHei", 11))
-        lb.pack(fill="both", expand=True)
-        for c in changes:
-            action = {"add": "新增", "modify": "修改",
-                      "delete": "刪除", "rename": "重新命名"}.get(
-                          c.get("action", "add"), "新增")
-            lb.insert("end", "[%s] %s（%s，%s）" % (
-                action, c.get("rel_path", "?"),
-                c.get("ai_name", "?"), c.get("time", "")[:19]))
-        btns = ttk.Frame(win)
-        btns.pack(fill="x", padx=16, pady=14)
-        ttk.Button(btns, text="同意同步",
-                   command=lambda: (result.update(ok=True), win.destroy())
-                   ).pack(side="left", padx=(0, 10))
-        ttk.Button(btns, text="稍後再說",
-                   command=win.destroy).pack(side="left")
-        self.root.wait_window(win)
-        return result["ok"]
+        def run():
+            import tkinter as tk
+            from tkinter import ttk
+            result = {"ok": False}
+            win = tk.Toplevel(self.root)
+            win.title("AI File：立即同步")
+            win.attributes("-topmost", True)
+            win.geometry("560x420")
+            ttk.Label(win, text="Muse 想同步以下變更到你的電腦：",
+                      font=("Microsoft JhengHei", 12, "bold")).pack(
+                          anchor="w", padx=16, pady=(14, 6))
+            ttk.Label(win, text="請先看過清單，確認沒問題再按「同意同步」。",
+                      font=("Microsoft JhengHei", 10)).pack(
+                          anchor="w", padx=16, pady=(0, 8))
+            frame = ttk.Frame(win)
+            frame.pack(fill="both", expand=True, padx=16)
+            lb = tk.Listbox(frame, font=("Microsoft JhengHei", 11))
+            lb.pack(fill="both", expand=True)
+            for c in changes:
+                action = {"add": "新增", "modify": "修改",
+                          "delete": "刪除", "rename": "重新命名"}.get(
+                              c.get("action", "add"), "新增")
+                lb.insert("end", "[%s] %s（%s，%s）" % (
+                    action, c.get("rel_path", "?"),
+                    c.get("ai_name", "?"), c.get("time", "")[:19]))
+            btns = ttk.Frame(win)
+            btns.pack(fill="x", padx=16, pady=14)
+            ttk.Button(btns, text="同意同步",
+                       command=lambda: (result.update(ok=True), win.destroy())
+                       ).pack(side="left", padx=(0, 10))
+            ttk.Button(btns, text="稍後再說",
+                       command=win.destroy).pack(side="left")
+            self.root.wait_window(win)
+            return result["ok"]
+        return self._on_main(run)
 
     # -- 浮動視窗 --------------------------------------------------
     def open_floating(self):
@@ -817,8 +980,11 @@ class TkUI:
         ttk.Button(btns2, text="結束程式",
                    command=self.agent.quit_program
                    ).pack(side="left")
-        ttk.Label(win, text="關掉視窗只會隱藏，程式還在跑；"
-                  "要真正結束請按「結束程式」。",
+        ttk.Label(win, text=("關掉視窗只會隱藏，程式還在跑；"
+                  "對系統匣圖示按右鍵可以顯示視窗或結束程式。"
+                  if self.tray_available else
+                  "關掉視窗只會隱藏，程式還在跑；"
+                  "要真正結束請按「結束程式」。"),
                   font=("Microsoft JhengHei", 9)).pack(
                       anchor="w", padx=12, pady=(0, 4))
         stop_btn = tk.Button(
@@ -897,59 +1063,85 @@ class TkUI:
                 "被改過／刪掉的檔案會從備份還原，被新增的檔案會刪掉。",
                 parent=win):
             return
-        agent.undo_batch(batch_id)
-        win.destroy()
-        self.open_history(agent)
+        # 還原要讀寫磁碟和網路，在背景跑，視窗不卡住；做完再回主執行緒刷新
+        def work():
+            agent.undo_batch(batch_id)
+
+            def refresh():
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                self.open_history(agent)
+            self.call_on_main(refresh)
+        threading.Thread(target=work, daemon=True).start()
 
     def quit_program(self):
-        """真的結束整個程式（關掉浮動視窗只會隱藏，程式還在跑）。"""
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+        """真的結束整個程式（關掉浮動視窗只會隱藏，程式還在跑）。
+        先移除系統匣圖示再關視窗，圖示才不會留在系統匣裡。"""
+        def run():
+            try:
+                tray = getattr(self.agent, "tray", None)
+                if tray is not None:
+                    tray.stop()
+            except Exception:
+                pass
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+        self._on_main(run)
 
     def add_activity(self, entry):
-        if self.float_list is None:
-            return
-        try:
-            action = {"add": "新增", "modify": "修改", "delete": "刪除",
-                      "rename": "重新命名",
-                      "session-approved": "已允許連線",
-                      "session-rejected": "已拒絕連線",
-                      "rejected-path": "已拒絕越界",
-                      "stopped": "已停止",
-                      "undone": "已返回",
-                      "undo-requested": "要求返回",
-                      "undo-declined": "已拒絕返回",
-                      "synced": "已同步"}.get(entry.get("action", ""),
-                                                entry.get("action", ""))
-            text = "%s [%s] %s %s" % (
-                entry.get("at", "")[11:19], entry.get("ai_name", ""),
-                action, entry.get("rel_path", ""))
-            self.float_list.insert(0, text.strip())
-        except Exception:
-            pass
+        def run():
+            if self.float_list is None:
+                return
+            try:
+                action = {"add": "新增", "modify": "修改", "delete": "刪除",
+                          "rename": "重新命名",
+                          "session-approved": "已允許連線",
+                          "session-rejected": "已拒絕連線",
+                          "rejected-path": "已拒絕越界",
+                          "stopped": "已停止",
+                          "undone": "已返回",
+                          "undo-requested": "要求返回",
+                          "undo-declined": "已拒絕返回",
+                          "synced": "已同步"}.get(entry.get("action", ""),
+                                                    entry.get("action", ""))
+                text = "%s [%s] %s %s" % (
+                    entry.get("at", "")[11:19], entry.get("ai_name", ""),
+                    action, entry.get("rel_path", ""))
+                self.float_list.insert(0, text.strip())
+            except Exception:
+                pass
+        self._on_main(run)
 
     def set_status(self, text):
-        if self.float_status is not None:
-            try:
-                self.float_status.config(text="狀態：" + text)
-            except Exception:
-                pass
+        def run():
+            if self.float_status is not None:
+                try:
+                    self.float_status.config(text="狀態：" + text)
+                except Exception:
+                    pass
+        self._on_main(run)
 
     def set_conn(self, text):
-        if self.float_conn is not None:
-            try:
-                self.float_conn.config(text="連線狀態：" + text)
-            except Exception:
-                pass
+        def run():
+            if self.float_conn is not None:
+                try:
+                    self.float_conn.config(text="連線狀態：" + text)
+                except Exception:
+                    pass
+        self._on_main(run)
 
     def set_code(self, code):
-        if self.float_code is not None:
-            try:
-                self.float_code.config(text="工作階段代碼：" + code)
-            except Exception:
-                pass
+        def run():
+            if self.float_code is not None:
+                try:
+                    self.float_code.config(text="工作階段代碼：" + code)
+                except Exception:
+                    pass
+        self._on_main(run)
 
 
 class HeadlessUI:
@@ -963,6 +1155,9 @@ class HeadlessUI:
 
     def call_on_main(self, fn):
         fn()
+
+    def call_on_main_sync(self, fn):
+        return fn()
 
     def quit_app(self):
         self.quit_requested = True
@@ -1001,6 +1196,262 @@ class HeadlessUI:
         print("[代碼] " + code)
 
 
+# ---------------------------------------------------------------- 系統匣（Windows）
+class TrayIcon:
+    """Windows 系統匣圖示。只用 Python 標準函式庫（ctypes），不依賴 pywin32，
+    也不需要 pip。非 Windows 上 start() 直接回傳 False，什麼都不做。
+    右鍵選單只有兩項：「顯示視窗」「結束程式」；左鍵雙擊顯示視窗。
+    選單命令用 queue 傳回主執行緒（main 裡的 root.after 定期取用），
+    訊息執行緒絕對不直接動 tkinter。"""
+
+    WM_USER_TRAY = 0x0400 + 1
+    WM_RBUTTONUP = 0x0205
+    WM_LBUTTONDBLCLK = 0x0203
+    WM_COMMAND = 0x0111
+    WM_QUIT = 0x0012
+    NIM_ADD = 0x00000000
+    NIM_DELETE = 0x00000002
+    NIF_MESSAGE = 0x00000001
+    NIF_ICON = 0x00000002
+    NIF_TIP = 0x00000004
+    TPM_RETURNCMD = 0x0100
+    TPM_RIGHTBUTTON = 0x0002
+    ID_SHOW = 1001
+    ID_QUIT = 1002
+
+    def __init__(self, on_show, on_quit):
+        self.on_show = on_show
+        self.on_quit = on_quit
+        self.commands = queue.Queue()
+        self._hwnd = None
+        self._nid = None
+        self._user32 = None
+        self._shell32 = None
+        self._wndproc = None
+        self._running = False
+        self._thread = None
+        self._available = False
+
+    @property
+    def available(self):
+        return self._available
+
+    def start(self):
+        """建立系統匣圖示。非 Windows 回傳 False；失敗只記 log，回傳 False，
+        程式照常跑（沒有系統匣也能用）。"""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+            kernel32 = ctypes.windll.kernel32
+
+            WNDPROC = ctypes.WINFUNCTYPE(
+                wt.LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+            def wndproc(hwnd, msg, wparam, lparam):
+                if msg == self.WM_USER_TRAY:
+                    if lparam == self.WM_RBUTTONUP:
+                        self._show_menu(hwnd)
+                    elif lparam == self.WM_LBUTTONDBLCLK:
+                        self.commands.put("show")
+                    return 0
+                if msg == self.WM_COMMAND:
+                    cmd = wparam & 0xFFFF
+                    if cmd == self.ID_SHOW:
+                        self.commands.put("show")
+                    elif cmd == self.ID_QUIT:
+                        self.commands.put("quit")
+                    return 0
+                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            # WndProc 的參考一定要留著，否則會被 GC 收掉、訊息一來就當掉
+            self._wndproc = WNDPROC(wndproc)
+
+            class WNDCLASSW(ctypes.Structure):
+                _fields_ = [
+                    ("style", wt.UINT),
+                    ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int),
+                    ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wt.HINSTANCE),
+                    ("hIcon", wt.HICON),
+                    ("hCursor", wt.HCURSOR),
+                    ("hbrBackground", wt.HBRUSH),
+                    ("lpszMenuName", wt.LPCWSTR),
+                    ("lpszClassName", wt.LPCWSTR),
+                ]
+
+            hinstance = kernel32.GetModuleHandleW(None)
+            classname = "AIFileTrayWindow"
+            wc = WNDCLASSW()
+            wc.style = 0
+            wc.lpfnWndProc = self._wndproc
+            wc.cbClsExtra = 0
+            wc.cbWndExtra = 0
+            wc.hInstance = hinstance
+            wc.hIcon = None
+            wc.hCursor = None
+            wc.hbrBackground = None
+            wc.lpszMenuName = None
+            wc.lpszClassName = classname
+            if not user32.RegisterClassW(ctypes.byref(wc)):
+                raise RuntimeError("RegisterClassW 失敗")
+            hwnd = user32.CreateWindowExW(
+                0, classname, "AI File", 0,
+                0, 0, 0, 0, None, None, hinstance, None)
+            if not hwnd:
+                raise RuntimeError("CreateWindowExW 失敗")
+            self._hwnd = hwnd
+
+            # 圖示：優先從 pythonw.exe 抓，抓不到就用系統預設圖示
+            hicon = None
+            try:
+                pythonw = os.path.join(
+                    os.path.dirname(sys.executable), "pythonw.exe")
+                hicon = shell32.ExtractIconW(hinstance, pythonw, 0)
+            except Exception:
+                hicon = None
+            if not hicon:
+                hicon = user32.LoadIconW(None, 32512)  # IDI_APPLICATION
+
+            class NOTIFYICONDATAW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wt.DWORD),
+                    ("hWnd", wt.HWND),
+                    ("uID", wt.UINT),
+                    ("uFlags", wt.UINT),
+                    ("uCallbackMessage", wt.UINT),
+                    ("hIcon", wt.HICON),
+                    ("szTip", wt.WCHAR * 128),
+                    ("dwState", wt.DWORD),
+                    ("dwStateMask", wt.DWORD),
+                    ("szInfo", wt.WCHAR * 256),
+                    ("uVersion", wt.UINT),
+                    ("szInfoTitle", wt.WCHAR * 64),
+                    ("dwInfoFlags", wt.DWORD),
+                    ("guidItem", wt.BYTE * 16),
+                    ("hBalloonIcon", wt.HICON),
+                ]
+
+            nid = NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+            nid.hWnd = hwnd
+            nid.uID = 1
+            nid.uFlags = self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP
+            nid.uCallbackMessage = self.WM_USER_TRAY
+            nid.hIcon = hicon
+            nid.szTip = "AI File"
+            if not shell32.Shell_NotifyIconW(self.NIM_ADD,
+                                             ctypes.byref(nid)):
+                raise RuntimeError("Shell_NotifyIconW 失敗")
+            self._nid = nid
+            self._user32 = user32
+            self._shell32 = shell32
+            self._available = True
+            self._running = True
+            self._thread = threading.Thread(target=self._message_loop,
+                                            daemon=True)
+            self._thread.start()
+            log_local("系統匣圖示已建立（右鍵：顯示視窗／結束程式）")
+            return True
+        except Exception as e:
+            log_local("系統匣啟用失敗（繼續使用，沒有系統匣也能用）：%s" % e)
+            return False
+
+    def _message_loop(self):
+        """獨立訊息迴圈（daemon thread）：收 Windows 訊息、轉給 WndProc。"""
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class MSG(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", wt.HWND),
+                ("message", wt.UINT),
+                ("wParam", wt.WPARAM),
+                ("lParam", wt.LPARAM),
+                ("time", wt.DWORD),
+                ("pt", wt.POINT),
+            ]
+
+        msg = MSG()
+        user32 = self._user32
+        while self._running:
+            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if ret <= 0:
+                break
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _show_menu(self, hwnd):
+        """右鍵彈出選單（在訊息執行緒裡跑，只把選到的命令放進 queue）。"""
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+
+            user32 = self._user32
+            menu = user32.CreatePopupMenu()
+            if not menu:
+                return
+            user32.AppendMenuW(menu, 0, self.ID_SHOW, "顯示視窗")
+            user32.AppendMenuW(menu, 0, self.ID_QUIT, "結束程式")
+            pt = wt.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            user32.SetForegroundWindow(hwnd)
+            cmd = user32.TrackPopupMenu(
+                menu, self.TPM_RETURNCMD | self.TPM_RIGHTBUTTON,
+                pt.x, pt.y, 0, hwnd, None)
+            if cmd == self.ID_SHOW:
+                self.commands.put("show")
+            elif cmd == self.ID_QUIT:
+                self.commands.put("quit")
+            user32.DestroyMenu(menu)
+        except Exception as e:
+            log_local("系統匣選單失敗：%s" % e)
+
+    def poll(self):
+        """主執行緒定期呼叫：把選單命令交給 tkinter 主執行緒處理。"""
+        try:
+            while True:
+                cmd = self.commands.get_nowait()
+                if cmd == "show":
+                    try:
+                        self.on_show()
+                    except Exception:
+                        pass
+                elif cmd == "quit":
+                    try:
+                        self.on_quit()
+                    except Exception:
+                        pass
+        except queue.Empty:
+            pass
+
+    def stop(self):
+        """移除系統匣圖示、結束訊息迴圈（真正結束程式時呼叫）。"""
+        if not self._available:
+            return
+        self._running = False
+        try:
+            self._shell32.Shell_NotifyIconW(self.NIM_DELETE,
+                                            ctypes.byref(self._nid))
+        except Exception:
+            pass
+        try:
+            self._user32.PostMessageW(self._hwnd, self.WM_QUIT, 0, 0)
+        except Exception:
+            pass
+        try:
+            self._user32.DestroyWindow(self._hwnd)
+        except Exception:
+            pass
+        self._available = False
+        log_local("系統匣圖示已移除")
+
+
 # ---------------------------------------------------------------- Agent 主邏輯
 class Agent:
     def __init__(self, config, relay, ui):
@@ -1020,6 +1471,8 @@ class Agent:
         self._pending_notice_sig = None
         self._last_poll_ok_at = 0
         self._last_poll_error = ""
+        self.tray = None          # 系統匣圖示（main 啟動時設定）
+        self._poll_running = False  # 背景輪詢同時只跑一輪
 
     # -- 連線狀態 --------------------------------------------------
     def _note_conn_ok(self):
@@ -1381,8 +1834,10 @@ class Agent:
             self.ui.set_code(self.session_code)
             self.ui.set_status("監控中 — %s" % os.path.basename(
                 os.path.normpath(self.allowed_folder)))
-            self.send_heartbeat(force=True)
-            self.publish_snapshot()
+            # 心跳和快照是網路操作，在背景跑，不卡設定精靈關掉後的畫面
+            threading.Thread(target=lambda: (
+                self.send_heartbeat(force=True),
+                self.publish_snapshot()), daemon=True).start()
             log_local("重設完成，已用新設定繼續監控")
             return True
         # 使用者關掉精靈沒存：沒有設定了，停在停止狀態
@@ -1395,20 +1850,28 @@ class Agent:
     # -- 停止 ------------------------------------------------------
     def stop_from_local(self):
         self.stopped = True
-        try:
-            self.relay.put_json("stop.json", {
-                "stopped": True, "by": "local", "at": utcnow_iso()},
-                "AI File：本地端按下停止")
-            append_activity(self.relay, {
-                "action": "stopped", "ai_name": "",
-                "detail": "使用者在本地端按下停止"})
-        except Exception as e:
-            log_local("寫入停止旗標失敗：%s" % e)
         self.ui.set_status("已停止 — Muse 動不到任何檔案")
-        self.ui.notify("AI File 已停止",
-                       "已經停止，Muse 現在動不到你的檔案。\n"
-                       "要恢復請到網頁版管理員介面按「恢復」，或重新啟動 AI File。")
-        log_local("使用者在本地端按下停止")
+
+        def work():
+            try:
+                self.relay.put_json("stop.json", {
+                    "stopped": True, "by": "local", "at": utcnow_iso()},
+                    "AI File：本地端按下停止")
+                append_activity(self.relay, {
+                    "action": "stopped", "ai_name": "",
+                    "detail": "使用者在本地端按下停止"})
+            except Exception as e:
+                log_local("寫入停止旗標失敗：%s" % e)
+
+            def done():
+                self.ui.notify("AI File 已停止",
+                               "已經停止，Muse 現在動不到你的檔案。\n"
+                               "要恢復請到網頁版管理員介面按「恢復」，"
+                               "或重新啟動 AI File。")
+            self.ui.call_on_main(done)
+            log_local("使用者在本地端按下停止")
+        # 寫中繼是網路操作，在背景跑，浮動視窗按下去立刻有反應
+        threading.Thread(target=work, daemon=True).start()
 
     # -- 心跳 ------------------------------------------------------
     def send_heartbeat(self, force=False):
@@ -1432,7 +1895,7 @@ class Agent:
     # -- 工作階段 --------------------------------------------------
     def _check_session(self):
         try:
-            session, _ = self.relay.get_json("session.json")
+            session, session_sha = self.relay.get_json("session.json")
         except Exception as e:
             log_local("讀取 session.json 失敗：%s" % e)
             return
@@ -1454,8 +1917,16 @@ class Agent:
         if ok:
             session["status"] = "approved"
             session["approved_at"] = utcnow_iso()
-            self.relay.put_json("session.json", session,
-                                "AI File：允許工作階段")
+            try:
+                self.relay.put_json("session.json", session,
+                                    "AI File：允許工作階段", sha=session_sha)
+            except RelayError as e:
+                if getattr(e, "status", None) == 409:
+                    # 寫入的當下 session.json 剛被另一邊改過：下輪重讀再問一次
+                    self._seen_waiting.discard(key)
+                    log_local("允許工作階段時遇到 409，下輪重讀再問一次")
+                    return
+                raise
             append_activity(self.relay, {
                 "action": "session-approved", "ai_name": ai_name})
             self.ui.notify("AI File", "已允許「%s」連線。" % ai_name)
@@ -1464,8 +1935,15 @@ class Agent:
             log_local("已允許工作階段：%s" % ai_name)
         else:
             session["status"] = "stopped"
-            self.relay.put_json("session.json", session,
-                                "AI File：拒絕工作階段")
+            try:
+                self.relay.put_json("session.json", session,
+                                    "AI File：拒絕工作階段", sha=session_sha)
+            except RelayError as e:
+                if getattr(e, "status", None) == 409:
+                    self._seen_waiting.discard(key)
+                    log_local("拒絕工作階段時遇到 409，下輪重讀再問一次")
+                    return
+                raise
             append_activity(self.relay, {
                 "action": "session-rejected", "ai_name": ai_name})
             self.ui.notify("AI File", "已拒絕「%s」的連線請求。" % ai_name)
@@ -1743,16 +2221,56 @@ class Agent:
                 log_local("儲存同步紀錄失敗：%s" % e)
         elif os.path.isdir(batch_dir):
             shutil.rmtree(batch_dir, ignore_errors=True)
-        # 更新 manifest：只留還沒成功的
-        try:
-            self.relay.put_json("pending/manifest.json",
-                                {"files": remaining},
-                                "AI File：更新待同步清單")
-        except Exception as e:
-            log_local("更新待同步清單失敗：%s" % e)
+        # 更新 manifest：從最新清單扣掉這批已處理的項目。
+        # 不能直接用本批算出來的 remaining 蓋掉整份清單：同步進行時，
+        # 網頁端可能同時暫存了新項目，直接蓋掉會把新項目刪掉。
+        remove_entries = [e for e in files
+                          if _manifest_entry_key(e) not in
+                          {_manifest_entry_key(r) for r in remaining}]
+        self._update_manifest_remove(remove_entries)
         # 同步完更新一次快照，檔案總管才看得到最新的樣子
         self.publish_snapshot()
         return results
+
+    def _update_manifest_remove(self, remove_entries):
+        """從中繼的待同步清單扣掉指定項目。先重讀最新清單再扣、再寫，
+        409 就重讀一次再扣（最多 3 次），不會蓋掉網頁端同時暫存的新項目。
+        回傳 True（寫好了）或 False（重試後還是失敗，只寫 log）。"""
+        remove_keys = {_manifest_entry_key(e) for e in remove_entries}
+        for attempt in range(1, WRITE_RETRY_MAX + 1):
+            try:
+                data, sha = self.relay.get_json("pending/manifest.json")
+            except Exception as e:
+                # 讀不到就不要寫：當成空清單寫回去會把別人的暫存項目清掉。
+                log_local("讀取待同步清單失敗（第 %d 次）：%s" % (attempt, e))
+                if attempt < WRITE_RETRY_MAX:
+                    time.sleep(0.05 + random.random() * 0.15)
+                    continue
+                return False
+            files = (data.get("files") if isinstance(data, dict)
+                     else None) or []
+            remaining = [f for f in files
+                         if _manifest_entry_key(f) not in remove_keys]
+            try:
+                self.relay.put_json("pending/manifest.json",
+                                    {"files": remaining},
+                                    "AI File：更新待同步清單", retry=False,
+                                    sha=sha, create_only=(sha is None))
+                return True
+            except RelayError as e:
+                if getattr(e, "status", None) in (409, 422) \
+                        and attempt < WRITE_RETRY_MAX:
+                    log_local("更新待同步清單遇到 %s，重試第 %d 次"
+                              % (getattr(e, "status", "?"), attempt))
+                    time.sleep(0.05 + random.random() * 0.15)
+                    continue
+                log_local("更新待同步清單失敗（已重試 %d 次）：%s"
+                          % (WRITE_RETRY_MAX, e))
+                return False
+            except Exception as e:
+                log_local("更新待同步清單失敗：%s" % e)
+                return False
+        return False
 
     def _record_applied(self, entry, result, batch_id=None):
         verb = {"add": "新增", "modify": "修改",
@@ -1804,6 +2322,25 @@ class Agent:
         log_local("拒絕：%s（%s）" % (entry.get("rel_path", ""), reason))
 
     # -- 輪詢 ------------------------------------------------------
+    def poll_in_thread(self):
+        """在背景執行緒跑一輪輪詢，浮動視窗不會被網路卡住。
+        同時只跑一輪：上一輪還沒跑完（例如 GitHub 很慢）就跳過這一輪，
+        不會越積越多。對話框與狀態列由 TkUI 轉回主執行緒顯示。"""
+        if self._poll_running:
+            return
+        self._poll_running = True
+
+        def work():
+            try:
+                self.poll_once()
+            except Exception:
+                traceback.print_exc()
+                log_local("輪詢出錯（已略過，下一輪繼續）")
+            finally:
+                self._poll_running = False
+
+        threading.Thread(target=work, daemon=True).start()
+
     def poll_once(self):
         """跑一輪：停止旗標 → 心跳 → 工作階段 → 重新生成 → 待同步。"""
         if self._resetting:
@@ -1971,7 +2508,7 @@ def reset_approved_session_on_start(relay):
     """每次啟動時：如果中繼的 session 還是上次的 approved，重設回 waiting，
     AI 要重新取得一次「是」才行（否則重開程式就自動同意了）。"""
     try:
-        session, _ = relay.get_json("session.json")
+        session, session_sha = relay.get_json("session.json")
     except Exception as e:
         log_local("啟動時讀取 session.json 失敗：%s" % e)
         return
@@ -1980,7 +2517,8 @@ def reset_approved_session_on_start(relay):
         session["reset_at"] = utcnow_iso()
         try:
             relay.put_json("session.json", session,
-                           "AI File：啟動時重設工作階段為等待")
+                           "AI File：啟動時重設工作階段為等待",
+                           sha=session_sha)
             log_local("啟動時把上次已允許的工作階段重設回等待"
                       "（AI 要重新取得一次「是」）")
         except Exception as e:
@@ -2026,35 +2564,44 @@ def main(argv):
     ui = TkUI(root, None)
     agent = Agent(cfg, relay, ui)
     ui.agent = agent
+    ui._ensure_drain()  # 背景執行緒的介面工作由主執行緒的 queue 迴圈消化
+    # 系統匣：Windows 才會真的建立圖示，其他平台安靜跳過
+    agent.tray = TrayIcon(on_show=ui.open_floating,
+                          on_quit=ui.quit_program)
+    ui.tray_available = agent.tray.start()
     ui.open_floating()
     ui.set_code(agent.session_code)
     ui.set_status("監控中 — %s" % os.path.basename(
         os.path.normpath(agent.allowed_folder)))
 
-    # 啟動時把上次已允許的工作階段重設回等待：重開程式不等於自動同意
-    try:
-        reset_approved_session_on_start(relay)
-    except Exception:
-        pass
+    # 啟動時的網路工作（重設工作階段、檢查更新、心跳、快照）全部在背景跑：
+    # 浮動視窗先出來，不等網路，GitHub 很慢也不會卡在啟動畫面
+    def startup_work():
+        # 啟動時把上次已允許的工作階段重設回等待：重開程式不等於自動同意
+        try:
+            reset_approved_session_on_start(relay)
+        except Exception:
+            pass
+        # 啟動時自動更新：開始輪詢之前先檢查，有新版就更新、重啟
+        has_new, remote = check_for_update()
+        if has_new and perform_update(remote):
+            def begin_update():
+                ui.set_status("正在更新到 v%s…" % remote)
+                log_local("正在更新到 v%s，完成後自動重開" % remote)
+                run_updater_and_exit()
+                root.after(2000, root.destroy)
+            ui.call_on_main(begin_update)
+            return
+        agent.send_heartbeat(force=True)
+        # 啟動完成就做一次快照，網頁版一打開就有最新的清單
+        agent.publish_snapshot()
+
+    threading.Thread(target=startup_work, daemon=True).start()
 
     # 第一次啟動：在背景建立桌面捷徑（失敗就靜默，只寫 log）
     if not cfg.get("shortcut_created"):
         threading.Thread(target=_make_shortcut_once, args=(cfg,),
                          daemon=True).start()
-
-    # 啟動時自動更新：開始輪詢之前先檢查，有新版就更新、重啟
-    has_new, remote = check_for_update()
-    if has_new and perform_update(remote):
-        ui.set_status("正在更新到 v%s…" % remote)
-        log_local("正在更新到 v%s，完成後自動重開" % remote)
-        run_updater_and_exit()
-        root.after(2000, root.destroy)
-        root.mainloop()
-        return 0
-
-    agent.send_heartbeat(force=True)
-    # 啟動完成就做一次快照，網頁版一打開就有最新的清單
-    agent.publish_snapshot()
 
     if "--once" in argv:
         try:
@@ -2068,13 +2615,20 @@ def main(argv):
     def tick():
         try:
             if not agent._resetting:
-                agent.poll_once()
+                agent.poll_in_thread()
         except Exception:
             traceback.print_exc()
             log_local("輪詢出錯（已略過，下一輪繼續）")
         root.after(POLL_INTERVAL * 1000, tick)
 
+    # 系統匣選單命令每 0.5 秒取一次，在主執行緒處理
+    def drain_tray():
+        if agent.tray is not None:
+            agent.tray.poll()
+        root.after(500, drain_tray)
+
     root.after(POLL_INTERVAL * 1000, tick)
+    root.after(500, drain_tray)
     log_local("AI File 已啟動，監控：%s" % agent.allowed_folder)
     try:
         root.mainloop()
@@ -2150,7 +2704,7 @@ def run_core_check():
         checks.append(("快照：上限截斷",
                        build_snapshot(_snap_dir, max_entries=2)
                        ["truncated"] is True))
-        checks.append(("VERSION 是 1.4", VERSION == "1.4"))
+        checks.append(("VERSION 是 1.5", VERSION == "1.5"))
     except Exception as e:
         print("檢查出錯：%s" % e)
         return 1

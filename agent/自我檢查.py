@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""AI File 自我檢查 v1.4
+"""AI File 自我檢查 v1.5
 檢查設定檔、路徑守門、雜湊驗證、停止旗標、manifest 解析、版本比對、連線、
-備份與返回、快照、重新命名、資料夾刪除。
+備份與返回、快照、重新命名、資料夾刪除、activity 寫入重試、manifest 併入、
+系統匣 no-op、背景輪詢。
 用法：python 自我檢查.py
 全部 [OK] 才算通過。第 10 步連線是正式檢查：失敗會印完整錯誤＋原因對照，
 沒有 PAT 也會明確講要先完成設定精靈，不是一句警告就帶過。
@@ -10,6 +11,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -202,13 +204,13 @@ def main():
               "（需要先去 GitHub 產生細粒度 Token）")
 
     # 11. 版本比對
-    check("版本比對：1.4 > 1.3",
-          A.parse_version("1.4") > A.parse_version("1.3"))
+    check("版本比對：1.5 > 1.4",
+          A.parse_version("1.5") > A.parse_version("1.4"))
     check("版本比對：1.10 > 1.2",
           A.parse_version("1.10") > A.parse_version("1.2"))
-    check("版本比對：1.4 == 1.4",
-          A.parse_version("1.4") == A.parse_version("1.4"))
-    check("VERSION 是 1.4", A.VERSION == "1.4")
+    check("版本比對：1.5 == 1.5",
+          A.parse_version("1.5") == A.parse_version("1.5"))
+    check("VERSION 是 1.5", A.VERSION == "1.5")
 
     # 12. 備份與返回（本機假中繼＋自動同意的假 UI）
     btmp = tempfile.mkdtemp(prefix="aifile_check_undo_")
@@ -426,6 +428,159 @@ def main():
           cagent.undo_batch(did)
           and os.path.exists(os.path.join(callowed, "刪我", "一.txt"))
           and os.path.exists(os.path.join(callowed, "刪我", "二.txt")))
+
+    # 14. v1.5：activity 寫入重試、manifest 併入、系統匣 no-op、背景輪詢
+    # 假 GitHub API：用 dict 模擬 repo，PUT 時檢查 sha，不符就回 409
+    import base64 as _b64b
+
+    class FakeGitHub:
+        def __init__(self):
+            self.files = {}  # path -> (content_str, sha)
+            self.counter = 0
+            self.fail_put_409_times = 0
+
+        def _new_sha(self):
+            self.counter += 1
+            return "sha-%d" % self.counter
+
+        def request(self, method, path, body=None):
+            if method == "GET":
+                if path not in self.files:
+                    return None
+                content, sha = self.files[path]
+                return {"content": _b64b.b64encode(
+                    content.encode("utf-8")).decode("ascii"), "sha": sha}
+            if method == "PUT":
+                if self.fail_put_409_times > 0:
+                    self.fail_put_409_times -= 1
+                    raise A.RelayError(
+                        "GitHub API PUT %s 失敗（409）" % path, status=409)
+                cur = self.files.get(path)
+                if body.get("sha") is None and cur is not None:
+                    # 跟真的 GitHub 一樣：沒帶 sha 但檔案已存在 → 422
+                    raise A.RelayError(
+                        "GitHub API PUT %s 失敗（422）" % path, status=422)
+                if body.get("sha") is not None and (
+                        cur is None or body["sha"] != cur[1]):
+                    raise A.RelayError(
+                        "GitHub API PUT %s 失敗（409）" % path, status=409)
+                content = _b64b.b64decode(body["content"]).decode("utf-8")
+                self.files[path] = (content, self._new_sha())
+                return {"content": body["content"],
+                        "sha": self.files[path][1]}
+            if method == "DELETE":
+                self.files.pop(path, None)
+                return {}
+            raise AssertionError("不支援的方法 %s" % method)
+
+    def _fake_relay(fake):
+        r = A.GitHubRelay("fake")
+        r._request = fake.request
+        return r
+
+    # 14a. _put 遇到 409 會自動重試並成功
+    fake = FakeGitHub()
+    frelay = _fake_relay(fake)
+    fake.files["a.txt"] = ("舊內容", fake._new_sha())
+    fake.fail_put_409_times = 1
+    frelay.put_json("a.txt", {"x": 1}, "test")
+    check("寫入重試：409 後重試成功",
+          frelay.get_json("a.txt")[0] == {"x": 1})
+    # 14b. 409 一直失敗會明確報錯，不假裝成功
+    fake.fail_put_409_times = 99
+    try:
+        frelay.put_json("a.txt", {"x": 2}, "test")
+        check("寫入重試：一直 409 會報錯", False, "竟然沒報錯！")
+    except A.RelayError as e:
+        check("寫入重試：一直 409 會報錯",
+              getattr(e, "status", None) == 409)
+    # 14c. 兩邊同時寫 activity.json 不會丟紀錄
+    fake2 = FakeGitHub()
+    relay_a = _fake_relay(fake2)
+    relay_b = _fake_relay(fake2)
+    check("兩邊同時寫：B 先寫一筆",
+          A.append_activity(relay_b, {"action": "synced",
+                                      "ai_name": "B",
+                                      "rel_path": "b.txt"}) is True)
+    # A 寫的時候第一次 PUT 遇到 409（B 剛寫過），重讀再補
+    fake2.fail_put_409_times = 1
+    check("兩邊同時寫：A 遇到 409 後重試成功",
+          A.append_activity(relay_a, {"action": "synced",
+                                      "ai_name": "A",
+                                      "rel_path": "a.txt"}) is True)
+    act2, _ = relay_a.get_json("activity.json")
+    check("兩邊同時寫：兩筆都在，沒丟",
+          isinstance(act2, list) and len(act2) == 2
+          and {e.get("ai_name") for e in act2} == {"A", "B"})
+    # 14d. 409 一直失敗時 append_activity 回傳 False（不假裝存成功）
+    fake2.fail_put_409_times = 99
+    check("兩邊同時寫：重試耗盡回傳 False",
+          A.append_activity(relay_a, {"action": "synced",
+                                      "ai_name": "A",
+                                      "rel_path": "a2.txt"}) is False)
+    # 14e. manifest 更新不會蓋掉網頁端同時暫存的新項目
+    fake3 = FakeGitHub()
+    mrelay = _fake_relay(fake3)
+    mrelay.put_json("pending/manifest.json", {"files": [
+        {"id": "st-old", "rel_path": "舊的.txt"},
+        {"id": "st-new", "rel_path": "新的.txt"},
+    ]}, "test")
+    magent = A.Agent({"pat": "fake", "allowed_folder": allowed,
+                      "session_code": code},
+                     mrelay, A.HeadlessUI(approve=True))
+    check("manifest 併入：只扣掉已處理的項目，新項目留著",
+          magent._update_manifest_remove(
+              [{"id": "st-old", "rel_path": "舊的.txt"}]) is True
+          and [f["id"] for f in
+               mrelay.get_json("pending/manifest.json")[0]["files"]]
+          == ["st-new"])
+    fake3.fail_put_409_times = 1
+    check("manifest 併入：409 後重試成功",
+          magent._update_manifest_remove(
+              [{"id": "st-new", "rel_path": "新的.txt"}]) is True
+          and mrelay.get_json("pending/manifest.json")[0]["files"] == [])
+    # 14f. 系統匣：非 Windows 上是 no-op，不報錯
+    tray = A.TrayIcon(on_show=lambda: None, on_quit=lambda: None)
+    check("系統匣：非 Windows 上 start() 回傳 False",
+          tray.start() is False and tray.available is False)
+    try:
+        tray.poll()
+        tray.stop()
+        check("系統匣：非 Windows 上 poll／stop 不報錯", True)
+    except Exception as e:
+        check("系統匣：非 Windows 上 poll／stop 不報錯", False, str(e))
+    called = []
+    tray2 = A.TrayIcon(on_show=lambda: called.append("show"),
+                       on_quit=lambda: called.append("quit"))
+    tray2.commands.put("show")
+    tray2.commands.put("quit")
+    tray2.poll()
+    check("系統匣：queue 命令會交給主執行緒的回呼",
+          called == ["show", "quit"])
+    # 14g. 背景輪詢：poll_in_thread 立刻回來，跑完旗標歸零
+    stmp = tempfile.mkdtemp(prefix="aifile_check_slow_")
+
+    class SlowRelay(A.LocalRelay):
+        def get_json(self, path):
+            time.sleep(0.3)
+            return super().get_json(path)
+
+    srelay = SlowRelay(stmp)
+    srelay.put_json("stop.json", {"stopped": False}, "test")
+    srelay.put_json("session.json", {
+        "status": "approved", "ai_name": "Muse",
+        "code_hash": A.code_hash(code)}, "test")
+    srelay.put_json("pending/manifest.json", {"files": []}, "test")
+    sagent = A.Agent({"pat": "fake", "allowed_folder": allowed,
+                      "session_code": code},
+                     srelay, A.HeadlessUI(approve=True))
+    sagent.poll_in_thread()
+    check("背景輪詢：poll_in_thread 立刻回來（不卡住）",
+          sagent._poll_running is True)
+    sagent.poll_in_thread()  # 上一輪還沒跑完，直接跳過
+    time.sleep(4)
+    check("背景輪詢：跑完後旗標歸零",
+          sagent._poll_running is False)
 
     print("=" * 40)
     print("結果：%d 通過，%d 失敗" % (PASS, FAIL))
