@@ -38,7 +38,7 @@ GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到使用者�
 - `activity.json`：活動紀錄（append-only，含每次新增／修改／刪除／拒絕／停止）
 - `heartbeat.json`：本地端每 30 秒更新（最後上線時間、允許的資料夾名稱、版本）
 
-## 網頁版功能（公開 repo `ai-file` 的 `web/`）
+## 網頁版功能（公開 repo `ai-file` 的根目錄）
 - 右上角「管理員登入」：第一次設定帳號密碼（只鎖該瀏覽器的介面）；登入後是管理員介面。
 - 管理員介面：連線狀態（讀 `heartbeat.json`，新鮮＝已連線，過期＝未連線，顯示「用代碼連線」提示）、允許的資料夾、工作階段代碼顯示＋重新生成、停止／恢復、待同步清單、過去所有異動紀錄（讀 `activity.json`）。
 - 「AI 登入」：輸入 AI 名稱＋貼上代碼，登入後是暫存介面：上傳檔案或貼上檔案內容、指定相對路徑、暫存；預設跳到正在工作的那個資料夾（讀 `heartbeat.json` 的資料夾名稱顯示）。
@@ -55,7 +55,7 @@ GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到使用者�
 - `自我檢查.py`、`檔案清單.txt`、`VERSION`（根目錄，內容只有版本號，v1 = `1`）。
 
 ## 檔案清單（公開 repo）
-- `web/index.html`、`web/app.js`、`web/style.css`（GitHub Pages 網站）
+- `index.html`、`app.js`、`style.css`（GitHub Pages 網站，放在 repo 根目錄；v1.1 之前在 `web/`，Pages 只認根目錄所以首頁顯示成 README，已移出並刪除 `web/`）
 - `agent/ai_file_agent.py`、`agent/啟動 AI File.bat`、`agent/啟動 AI File.vbs`、`agent/自我檢查.py`、`agent/檔案清單.txt`
 - `agent.md`、`README.md`、`VERSION`、`.gitignore`（`ai-file-config.json`、`ai-file-log.txt` 絕不進版控）
 - `圖片翻譯程式`、`GitHub 版本管理器` 的做法沿用：`VERSION` 檔案慣例、自我檢查、xvfb 測試。
@@ -69,4 +69,5 @@ GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到使用者�
 
 ## 版本歷史
 - v1（2026-11-22）：第一版。網頁版（管理員登入、AI 登入、待同步、異動紀錄、停止／重新生成代碼）＋ Windows 本地端（.bat 啟動、通知、浮動視窗、立即同步、路徑守門）＋ 私人中繼 repo。部署到 GitHub Pages（公開 `ai-file`）。
+- v1.1（2026-11-22）：修首頁問題。v1 把網頁放在 `web/`，但 GitHub Pages 只認 repo 根目錄，所以首頁顯示成 README.md。把 `index.html`、`app.js`、`style.css` 移到根目錄，刪除 `web/`。VERSION 1 → 1.1。
   - 測試紀錄（2026-11-22，Linux VM）：`py_compile` 全部通過；`node --check web/app.js` 通過；HTML 解析通過；app.js 用到的 52 個元素 ID 全部在 index.html 裡；程式碼裡沒有任何真實 token／密碼。自我檢查 19/19 通過（路徑守門 5 項、SHA-256 3 項、代碼格式 3 項、manifest、停止旗標、同步流程 2 項；2 個[警告]是預期的：尚未設定、沒有真 PAT 所以未測中繼連線）。獨立單元測試 15/15 通過（錯誤代碼拒收、雜湊不符拒收、正常寫入含子目錄、刪除、停止旗標停手＋恢復、重新生成代碼＋舊代碼失效、工作階段按「是」／按「否」、越界拒絕、缺欄位不崩潰）。xvfb GUI 測試 10/10 通過（設定精靈開、填、存＋代碼雜湊寫進中繼、浮動視窗開＋列出異動、工作階段詢問按「是」、立即同步對話框按「同意」後檔案寫入＋清單清空）。測試中抓到兩個測試本身的 bug（停止旗標沒清除、假雜湊）並修掉，程式邏輯本身沒改。未測：Windows .bat／.vbs 實機啟動、真實 PAT 連線、GitHub Pages 實際上線、瀏覽器裡的完整 AI 登入→暫存→同步流程。

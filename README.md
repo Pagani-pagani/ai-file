@@ -8,7 +8,7 @@
 GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到你的電腦。
 所以用 GitHub 當中繼，電腦才是守門員：
 
-- **公開 repo `Pagani-pagani/ai-file`**：這個專案。放網頁版（`web/`）和 Windows 本地端程式（`agent/`）。裡面不放任何機密資料。
+- **公開 repo `Pagani-pagani/ai-file`**：這個專案。放網頁版（repo 根目錄的 `index.html`、`app.js`、`style.css`）和 Windows 本地端程式（`agent/`）。裡面不放任何機密資料。
 - **私人 repo `Pagani-pagani/ai-file-relay`**：中繼資料，只有本人能存取。放待同步檔案、工作階段、停止旗標、活動紀錄、心跳。
 - **網頁版**：`https://pagani-pagani.github.io/ai-file/`（啟用 GitHub Pages 後）。用瀏覽器 localStorage 裡的 Token 呼叫 GitHub API 讀寫中繼 repo。
 - **本地端**：Python 程式，只用標準函式庫，不用 pip。`啟動 AI File.bat` 啟動後定時輪詢中繼 repo，只在你按「同意」後才把檔案寫進允許的資料夾。
@@ -73,7 +73,7 @@ GitHub Pages 是靜態網站，沒有伺服器，網頁本身碰不到你的電�
 
 ## 檔案清單
 
-- `web/index.html`、`web/app.js`、`web/style.css`（GitHub Pages 網站）
+- `index.html`、`app.js`、`style.css`（GitHub Pages 網站，放在 repo 根目錄，Pages 只認根目錄）
 - `agent/ai_file_agent.py`、`agent/啟動 AI File.bat`、`agent/啟動 AI File.vbs`、`agent/自我檢查.py`、`agent/檔案清單.txt`
 - `agent.md`、`README.md`、`VERSION`、`.gitignore`
 
