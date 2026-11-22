@@ -1,0 +1,4 @@
+# AI File：以下檔案只存本機，絕不進版控
+ai-file-config.json
+ai-file-log.txt
+__pycache__/
